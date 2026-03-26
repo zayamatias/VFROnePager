@@ -300,6 +300,10 @@ def closest_airport(lat: float, lon: float,
             freq_str = best_freq(freqs, ())   # absolute fallback: any freq
         brg = bearing_to_destination(lat, lon, alat, alon)
         time_min = (dist / cruise_speed_kts * 60.0) if cruise_speed_kts > 0 else 0.0
+        try:
+            elev = float(row.get("elevation_ft") or 0.0)
+        except (ValueError, TypeError):
+            elev = 0.0
         return {
             "name":         row.get("name", icao),
             "icao":         icao,
@@ -309,6 +313,7 @@ def closest_airport(lat: float, lon: float,
             "bearing_true": round(brg, 0),
             "time_min":     round(time_min, 0),
             "runways":      runways_str(apt_id, icao),
+            "elevation_ft": round(elev),
         }
 
     # Prefer the closest airport that has frequency data (within MAX_SEARCH_NM).
@@ -596,6 +601,7 @@ def build_legs(origin: dict, destination: dict,
                 "alt_name":         alt["name"],
                 "alt_dist_nm":      alt["distance_nm"],
                 "alt_freq":         alt["freq"],
+                "alt_elevation_ft": alt.get("elevation_ft", 0),
                 "alt_bearing_mag":  round(alt_brg_mag),
                 "alt_time_min":     int(alt["time_min"]),
                 "alt_runways":      alt["runways"],
@@ -1069,19 +1075,23 @@ def draw_back_panel(c: canvas.Canvas,
                     origin: dict, destination: dict,
                     origin_freqs: list[dict], dest_freqs: list[dict],
                     enroute_airports: list[dict],
-                    x_offset: float = 0.0) -> None:
+                    x_offset: float = 0.0,
+                    rotate: bool = True) -> None:
     """
     Dibuja el Panel de Frecuencias, rotado 180 grados para impresion duplex
     con pliegue vertical.  Todo el texto en espanol.
     """
     c.saveState()
-
-    # Rotar 180 grados respecto al centro del panel A5
-    cx = x_offset + PANEL_W / 2
-    cy = PAGE_H / 2
-    c.translate(cx, cy)
-    c.rotate(180)
-    c.translate(-PANEL_W / 2, -PAGE_H / 2)
+    if rotate:
+        # Rotar 180 grados respecto al centro del panel A5 (for duplex printing)
+        cx = x_offset + PANEL_W / 2
+        cy = PAGE_H / 2
+        c.translate(cx, cy)
+        c.rotate(180)
+        c.translate(-PANEL_W / 2, -PAGE_H / 2)
+    else:
+        # No rotation: just translate to the right panel offset
+        c.translate(x_offset, 0)
 
     # ── Cabecera: linea + texto negro, sin relleno ──────────────────────
     hdr_h = 18 * mm
@@ -1180,7 +1190,12 @@ def draw_back_panel(c: canvas.Canvas,
                 icao = (apt.get("alt_icao") or "\u2014")[:6]
                 name = (apt.get("alt_name") or "\u2014")[:20]
                 rwys = apt.get("alt_runways", "")
-                name_cell = name + (f"\n{rwys}" if rwys else "")
+                elev = apt.get("alt_elevation_ft")
+                name_cell = name
+                if rwys:
+                    name_cell += f"\n{rwys}"
+                if elev is not None and elev != 0:
+                    name_cell += f"\nElev: {elev:.0f} ft"
                 dist = str(apt.get("alt_dist_nm", "\u2014"))
                 brg  = apt.get("alt_bearing_mag", None)
                 tmin = apt.get("alt_time_min", None)
@@ -1241,7 +1256,8 @@ def generate_pdf(output_path: str,
                  tc: float, mag_var: float, mh: float,
                  total_nm: float, ete_min: float,
                  fuel_required_gal: float,
-                 cruise_alt_ft: int = 0) -> None:
+                 cruise_alt_ft: int = 0,
+                 one_face: bool = False) -> None:
     """
     Genera un PDF duplex de dos paginas en A4 apaisado:
       Pagina 1 – Frontal: Hoja de Vuelo VFR en el panel A5 izquierdo
@@ -1264,29 +1280,50 @@ def generate_pdf(output_path: str,
     c.setAuthor("VFROnePager")
     c.setSubject("Planificaci\u00f3n de Vuelo VFR")
 
-    # ── PAGINA 1 (FRONTAL) ───────────────────────────────────────────────────
-    draw_front_panel(
-        c, origin, destination,
-        tc, mag_var, mh,
-        total_nm, ete_min, fuel_required_gal,
-        origin_freqs, dest_freqs, legs, descent_leg,
-        cruise_alt_ft=cruise_alt_ft,
-        x_offset=0,
-    )
-    draw_fold_guide(c)
-    c.showPage()
+    if one_face:
+        # Draw both panels side-by-side on a single A4 landscape page
+        draw_front_panel(
+            c, origin, destination,
+            tc, mag_var, mh,
+            total_nm, ete_min, fuel_required_gal,
+            origin_freqs, dest_freqs, legs, descent_leg,
+            cruise_alt_ft=cruise_alt_ft,
+            x_offset=0,
+        )
+        # Back panel unrotated on the right half
+        draw_back_panel(
+            c, origin, destination,
+            origin_freqs, dest_freqs, enroute,
+            x_offset=PANEL_W,
+            rotate=False,
+        )
+        draw_fold_guide(c)
+        c.showPage()
+    else:
+        # ── PAGINA 1 (FRONTAL) ───────────────────────────────────────────────────
+        draw_front_panel(
+            c, origin, destination,
+            tc, mag_var, mh,
+            total_nm, ete_min, fuel_required_gal,
+            origin_freqs, dest_freqs, legs, descent_leg,
+            cruise_alt_ft=cruise_alt_ft,
+            x_offset=0,
+        )
+        draw_fold_guide(c)
+        c.showPage()
 
-    # ── PAGINA 2 (DORSO) ─────────────────────────────────────────────────────
-    # Impresion duplex con giro por el borde largo (izquierdo):
-    #   El dorso del panel IZQUIERDO de la pag.1 se imprime en el DERECHO de la pag.2.
-    #   Rotamos 180 grados para que se lea correctamente al doblar verticalmente.
-    draw_back_panel(
-        c, origin, destination,
-        origin_freqs, dest_freqs, enroute,
-        x_offset=PANEL_W,   # mitad derecha de la hoja A4 apaisada
-    )
-    draw_fold_guide(c)
-    c.showPage()
+        # ── PAGINA 2 (DORSO) ─────────────────────────────────────────────────────
+        # Impresion duplex con giro por el borde largo (izquierdo):
+        #   El dorso del panel IZQUIERDO de la pag.1 se imprime en el DERECHO de la pag.2.
+        #   Rotamos 180 grados para que se lea correctamente al doblar verticalmente.
+        draw_back_panel(
+            c, origin, destination,
+            origin_freqs, dest_freqs, enroute,
+            x_offset=PANEL_W,   # mitad derecha de la hoja A4 apaisada
+            rotate=False,
+        )
+        draw_fold_guide(c)
+        c.showPage()
 
     c.save()
     print(f"\n  PDF guardado en: {output_path}")
@@ -1342,6 +1379,11 @@ def main() -> None:
             "(e.g. LONDON,51.514,-0.115).  Repeat for multiple waypoints "
             "in order: departure → WP1 → WP2 → … → destination."
         ),
+    )
+    parser.add_argument(
+        "--one-face", action="store_true", default=False,
+        help=("Render both front and back panels side-by-side on a single A4 face "
+              "(useful for single-sided printing / preview)."),
     )
     args = parser.parse_args()
 
@@ -1437,6 +1479,7 @@ def main() -> None:
         tc, mag_var, mh,
         total_nm, ete_min, fuel_req,
         cruise_alt_ft=cruise_alt,
+        one_face=args.one_face,
     )
 
     print(f"\nListo. Abrir '{output_path}' e imprimir duplex (voltear por borde largo).\n")

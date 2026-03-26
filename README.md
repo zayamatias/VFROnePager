@@ -6,10 +6,14 @@ Generate a one-page VFR trip plan (A5 panels on duplex A4) using free data sourc
 Summary
 -------
 - Single-file generator: `vfr_onepager.py`
-- Produces a duplex-ready PDF with a front VFR log and a rotated back frequency panel.
+- Produces a duplex-ready PDF with a front VFR log and a back frequency panel.
+Preview on a single face:
+```bash
+# To render both panels side-by-side on one A4 page (useful for single-sided preview):
+python3 vfr_onepager.py LEPP LEZG 100 10 --one-face -o preview.pdf
+```
 - Low-ink design and Spanish labels by default.
 
-Requirements
 ------------
 Install into a Python 3.9+ environment:
 
@@ -73,6 +77,8 @@ Behavior notes:
 - The climb-time factor only applies to the very first leg of the entire route (departure).
 - Waypoint markers are shown as shaded full-width rows in the PDF with the new track (magnetic) to the next point.
 
+ - Alternate entries now include airport elevation (e.g. "Elev: 1234 ft") when available.
+
 
 What the script does
 --------------------
@@ -100,8 +106,9 @@ Customization
  
 Output notes
 ------------
-- The generated PDF is duplex A4 landscape with two A5 panels: the left front panel contains the trip log (Spanish labels), the right back panel contains frequency information.
-- The alternative cell layout was tightened to be more compact (smaller leading) to fit multi-line alternative entries.
+- The generated PDF defaults to duplex A4 landscape with two A5 panels: the first page is the front panel, the second page is the back panel. The back panel is drawn unrotated so a normal duplex printer should print it on the back of page 1.
+- The `--one-face` flag renders both panels side-by-side on a single A4 page for single-sided previewing or quick checks.
+- The alternative cell layout was tightened to be more compact (smaller leading) to fit multi-line alternative entries; alternates also show elevation when available.
 
 Caveats / Legal
 ---------------
