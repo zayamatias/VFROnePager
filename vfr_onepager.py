@@ -49,6 +49,7 @@ OURAIRPORTS_AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/ai
 OURAIRPORTS_FREQS_URL    = "https://davidmegginson.github.io/ourairports-data/airport-frequencies.csv"
 OURAIRPORTS_RUNWAYS_URL  = "https://davidmegginson.github.io/ourairports-data/runways.csv"
 OPEN_ELEVATION_URL       = "https://api.open-elevation.com/api/v1/lookup"
+OPEN_TOPO_DATA_URL       = "https://api.opentopodata.org/v1/srtm30m"  # fallback
 NOMINATIM_URL            = "https://nominatim.openstreetmap.org/reverse"
 
 NM_PER_DEGREE   = 60.0          # 1° lat ≈ 60 NM
@@ -331,30 +332,64 @@ def closest_airport(lat: float, lon: float,
 
 
 # ---------------------------------------------------------------------------
-# Terrain elevation (Open-Elevation API)
+# Terrain elevation (Open-Elevation API with Open-Topo-Data fallback)
 # ---------------------------------------------------------------------------
 
-def get_elevations_m(points: list[tuple[float, float]]
-                     ) -> list[float]:
+def _get_elevations_open_elevation(locations: list[dict]) -> list[float]:
+    """Try Open-Elevation. Returns elevations in metres or raises on failure."""
+    resp = requests.post(
+        OPEN_ELEVATION_URL,
+        json={"locations": locations},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = data["results"]
+    if len(results) != len(locations):
+        raise ValueError(f"Open-Elevation returned {len(results)} results for {len(locations)} points")
+    return [r["elevation"] for r in results]
+
+
+def _get_elevations_opentopodata(locations: list[dict]) -> list[float]:
+    """Try Open-Topo-Data (SRTM 30m). Returns elevations in metres or raises on failure.
+    API expects locations as a pipe-separated string: 'lat,lon|lat,lon|...' (max 100 per request).
     """
-    Query Open-Elevation for a list of (lat, lon) tuples.
-    Returns a list of elevations in metres.
-    Silently falls back to 0 m on network errors.
+    # Build pipe-separated string as required by the Open-Topo-Data API
+    loc_str = "|".join(f"{loc['latitude']},{loc['longitude']}" for loc in locations)
+    resp = requests.post(
+        OPEN_TOPO_DATA_URL,
+        json={"locations": loc_str},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "OK":
+        raise ValueError(f"Open-Topo-Data status: {data.get('status')}")
+    results = data["results"]
+    if len(results) != len(locations):
+        raise ValueError(f"Open-Topo-Data returned {len(results)} results for {len(locations)} points")
+    return [r["elevation"] or 0.0 for r in results]
+
+
+def get_elevations_m(points: list[tuple[float, float]]) -> list[float]:
+    """
+    Query terrain elevation for a list of (lat, lon) tuples.
+    Tries Open-Elevation first; falls back to Open-Topo-Data (SRTM 30m).
+    Returns 0 m for each point if both sources fail.
     """
     if not points:
         return []
     locations = [{"latitude": lat, "longitude": lon} for lat, lon in points]
     try:
-        resp = requests.post(
-            OPEN_ELEVATION_URL,
-            json={"locations": locations},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [r["elevation"] for r in data["results"]]
+        return _get_elevations_open_elevation(locations)
     except Exception as exc:
-        print(f"    [warn] Open-Elevation query failed: {exc}", file=sys.stderr)
+        print(f"    [warn] Open-Elevation failed ({exc}); retrying with Open-Topo-Data...",
+              file=sys.stderr)
+    try:
+        return _get_elevations_opentopodata(locations)
+    except Exception as exc2:
+        print(f"    [warn] Open-Topo-Data also failed ({exc2}); using 0 m fallback.",
+              file=sys.stderr)
         return [0.0] * len(points)
 
 
