@@ -454,90 +454,156 @@ def magnetic_variation(lat: float, lon: float,
 def build_legs(origin: dict, destination: dict,
                cruise_speed_ias: float,
                fuel_consumption_gph: float,
-               mag_var: float = 0.0) -> list[dict]:
+               mag_var: float = 0.0,
+               waypoints: Optional[list[dict]] = None) -> list[dict]:
     """
-    Divide la ruta en intervalos de LEG_MINUTES minutos.
-    Cada tramo incluye terreno, referencia, alternativa mas cercana con
-    rumbo magnetico y tiempo de vuelo hasta ella.
-    """
-    total_nm   = gc_distance_nm(origin["lat"], origin["lon"],
-                                destination["lat"], destination["lon"])
-    speed_nm_per_min = cruise_speed_ias * KNOTS_TO_NM_PER_MIN
-    total_min  = total_nm / speed_nm_per_min
-    n_legs     = max(1, int(total_min / LEG_MINUTES))
+    Divide la ruta en intervalos de LEG_MINUTES minutos, respetando los
+    waypoints intermedios proporcionados.  Para cada segmento (origen →
+    wp1 → wp2 → … → destino) se generan tramos independientes y el
+    contador de tiempo se reinicia en cada waypoint.
 
-    # Primer tramo: velocidad de ascenso = velocidad crucero / CLIMB_SPEED_FACTOR
-    # La distancia cubierta es la misma (5 min a velocidad crucero),
-    # pero el tiempo real de vuelo es mayor.
-    first_leg_min = round(LEG_MINUTES * CLIMB_SPEED_FACTOR, 1)  # e.g. 6.5 min
-    fuel_per_leg_climb  = fuel_consumption_gph * (first_leg_min / 60.0)
+    Los waypoints intermedios deben ser dicts con: name, lat, lon.
+    En el primer tramo del primer segmento se aplica CLIMB_SPEED_FACTOR;
+    en el resto del viaje se usa velocidad de crucero completa.
+    """
+    waypoints = waypoints or []
+    stops: list[dict] = [origin] + waypoints + [destination]
+
+    speed_nm_per_min    = cruise_speed_ias * KNOTS_TO_NM_PER_MIN
     fuel_per_leg_cruise = fuel_consumption_gph * (LEG_MINUTES / 60.0)
+    first_leg_min       = round(LEG_MINUTES * CLIMB_SPEED_FACTOR, 1)  # e.g. 6.5 min
+    fuel_per_leg_climb  = fuel_consumption_gph * (first_leg_min / 60.0)
 
-    legs = []
-    prev_lat = origin["lat"]
-    prev_lon = origin["lon"]
+    all_legs: list[dict] = []
+    cumulative_min: float = 0.0   # running total for descent-insertion ordering
+    cumulative_dist: float = 0.0  # running total distance in NM
 
-    print(f"  Construyendo {n_legs} tramo(s) "
-          f"(1er tramo: {first_leg_min} min ascenso, resto: {LEG_MINUTES} min crucero) ...",
-          flush=True)
+    for seg_idx in range(len(stops) - 1):
+        seg_from = stops[seg_idx]
+        seg_to   = stops[seg_idx + 1]
+        is_first_segment = (seg_idx == 0)
 
-    for i in range(1, n_legs + 1):
-        fraction   = min(i * LEG_MINUTES / total_min, 1.0)
-        lat, lon   = intermediate_point(
-            origin["lat"], origin["lon"],
-            destination["lat"], destination["lon"],
-            fraction,
-        )
+        seg_nm  = gc_distance_nm(seg_from["lat"], seg_from["lon"],
+                                 seg_to["lat"],   seg_to["lon"])
+        seg_min = seg_nm / speed_nm_per_min
+        n_legs  = max(1, int(seg_min / LEG_MINUTES))
 
-        print(f"    Tramo {i}/{n_legs}: ({lat:.3f}, {lon:.3f})", flush=True)
+        # Segment track (true and magnetic) — constant for the whole segment
+        seg_track_true = bearing_to_destination(seg_from["lat"], seg_from["lon"],
+                               seg_to["lat"],   seg_to["lon"])
+        seg_track_mag = int(round((seg_track_true - mag_var + 360) % 360))
 
-        # Terreno
-        max_terr = max_terrain_elevation_ft(prev_lat, prev_lon, lat, lon)
-        min_alt  = max_terr + TERRAIN_BUFFER_FT
+        # ── Waypoint marker row (inserted before each segment after the first) ─
+        if seg_idx > 0:
+            new_tc  = bearing_to_destination(seg_from["lat"], seg_from["lon"],
+                                             seg_to["lat"],   seg_to["lon"])
+            new_mag = (new_tc - mag_var + 360) % 360
+            wp_name = seg_from.get("name") or seg_from.get("icao") or "WPT"
+            all_legs.append({
+                "is_waypoint":    True,
+                "waypoint_name":  wp_name,
+                "new_track_true": round(new_tc, 1),
+                "new_track_mag":  round(new_mag, 1),
+                "segment_track_true": seg_track_true,
+                "segment_track_mag": seg_track_mag,
+                "leg_num":        0,
+                "elapsed_min":    int(round(cumulative_min)),
+                "_cumulative_min": cumulative_min,
+                "_cumulative_dist": cumulative_dist,
+                "cum_dist_nm":     round(cumulative_dist, 1),
+                "lat":            seg_from["lat"],
+                "lon":            seg_from["lon"],
+                "landmark":       f"\u25ba WPT: {wp_name}  \u2192  {int(new_mag):03d}\u00b0M",
+                "max_terrain_ft": 0,
+                "min_alt_ft":     0,
+                "fuel_burned_gal": "",
+                "alt_icao":       "",
+                "alt_name":       "",
+                "alt_dist_nm":    0,
+                "alt_freq":       "",
+                "alt_bearing_mag": None,
+                "alt_time_min":   None,
+                "alt_runways":    "",
+            })
 
-        # Referencia a la izquierda del avion (~45 grados a la izquierda, ~8 NM)
-        # El rumbo de vuelo es el angulo desde el punto anterior al actual.
-        track_deg = bearing_to_destination(prev_lat, prev_lon, lat, lon)
-        left_bearing = (track_deg - 45 + 360) % 360   # 45 grados a la izquierda
-        lm_lat, lm_lon = offset_point(lat, lon, left_bearing, 8.0)
-        landmark = get_landmark(lm_lat, lm_lon, zoom=12)
+        print(f"  Segmento {seg_idx+1}/{len(stops)-1}: "
+              f"{seg_from.get('name', seg_from.get('icao','?'))} \u2192 "
+              f"{seg_to.get('name', seg_to.get('icao','?'))}  "
+              f"({seg_nm:.1f} NM, {n_legs} tramos) ...", flush=True)
 
-        # Alternativa mas cercana (excluyendo origen y destino)
-        alt = closest_airport(lat, lon,
-                               exclude_icaos=(origin["icao"], destination["icao"]),
-                               cruise_speed_kts=cruise_speed_ias)
-        # Convertir rumbo verdadero a rumbo magnetico
-        alt_brg_mag = (alt["bearing_true"] - mag_var + 360) % 360
+        prev_lat = seg_from["lat"]
+        prev_lon = seg_from["lon"]
 
-        # Tiempo acumulado: primer tramo dura first_leg_min, el resto LEG_MINUTES
-        if i == 1:
-            elapsed = first_leg_min
-            fuel_this_leg = fuel_per_leg_climb
-        else:
-            elapsed = first_leg_min + (i - 1) * LEG_MINUTES
-            fuel_this_leg = fuel_per_leg_cruise
+        for i in range(1, n_legs + 1):
+            fraction = min(i * LEG_MINUTES / seg_min, 1.0)
+            lat, lon = intermediate_point(
+                seg_from["lat"], seg_from["lon"],
+                seg_to["lat"],   seg_to["lon"],
+                fraction,
+            )
 
-        legs.append({
-            "leg_num":           i,
-            "elapsed_min":       elapsed,
-            "lat":               lat,
-            "lon":               lon,
-            "landmark":          landmark,
-            "max_terrain_ft":    round(max_terr),
-            "min_alt_ft":        round(min_alt / 100) * 100,
-            "fuel_burned_gal":   round(fuel_this_leg, 1),
-            "alt_icao":          alt["icao"],
-            "alt_name":          alt["name"],
-            "alt_dist_nm":       alt["distance_nm"],
-            "alt_freq":          alt["freq"],
-            "alt_bearing_mag":   round(alt_brg_mag),
-            "alt_time_min":      int(alt["time_min"]),
-            "alt_runways":       alt["runways"],
-        })
+            print(f"    Tramo {i}/{n_legs}: ({lat:.3f}, {lon:.3f})", flush=True)
 
-        prev_lat, prev_lon = lat, lon
+            # Terreno
+            max_terr = max_terrain_elevation_ft(prev_lat, prev_lon, lat, lon)
+            min_alt  = max_terr + TERRAIN_BUFFER_FT
 
-    return legs
+            # Referencia a la izquierda del avion (~45 grados, ~8 NM)
+            track_deg    = bearing_to_destination(prev_lat, prev_lon, lat, lon)
+            left_bearing = (track_deg - 45 + 360) % 360
+            lm_lat, lm_lon = offset_point(lat, lon, left_bearing, 8.0)
+            landmark = get_landmark(lm_lat, lm_lon, zoom=12)
+
+            # Alternativa mas cercana (excluyendo origen y destino)
+            alt = closest_airport(lat, lon,
+                                   exclude_icaos=(origin["icao"], destination["icao"]),
+                                   cruise_speed_kts=cruise_speed_ias)
+            alt_brg_mag = (alt["bearing_true"] - mag_var + 360) % 360
+
+            # Tiempo desde el ultimo waypoint/origen (se reinicia en cada segmento).
+            # Solo el primer tramo de la salida lleva factor de ascenso.
+            if is_first_segment and i == 1:
+                elapsed        = first_leg_min
+                fuel_this_leg  = fuel_per_leg_climb
+                leg_duration   = first_leg_min
+            else:
+                elapsed        = i * LEG_MINUTES
+                fuel_this_leg  = fuel_per_leg_cruise
+                leg_duration   = LEG_MINUTES
+
+            # Distancia del tramo desde el punto previo al punto actual
+            leg_dist = gc_distance_nm(prev_lat, prev_lon, lat, lon)
+            cumulative_dist += leg_dist
+
+            cumulative_min += leg_duration
+
+            all_legs.append({
+                "is_waypoint":      False,
+                "leg_num":          i,
+                "elapsed_min":      elapsed,
+                "_cumulative_min":  cumulative_min,
+                "segment_track_true": seg_track_true,
+                "segment_track_mag":  seg_track_mag,
+                "_cumulative_dist": cumulative_dist,
+                "cum_dist_nm":      round(cumulative_dist, 1),
+                "lat":              lat,
+                "lon":              lon,
+                "landmark":         landmark,
+                "max_terrain_ft":   round(max_terr),
+                "min_alt_ft":       round(min_alt / 100) * 100,
+                "fuel_burned_gal":  round(fuel_this_leg, 1),
+                "alt_icao":         alt["icao"],
+                "alt_name":         alt["name"],
+                "alt_dist_nm":      alt["distance_nm"],
+                "alt_freq":         alt["freq"],
+                "alt_bearing_mag":  round(alt_brg_mag),
+                "alt_time_min":     int(alt["time_min"]),
+                "alt_runways":      alt["runways"],
+            })
+
+            prev_lat, prev_lon = lat, lon
+
+    return all_legs
 
 
 def recommended_cruise_altitude(legs: list[dict]) -> int:
@@ -550,23 +616,25 @@ def recommended_cruise_altitude(legs: list[dict]) -> int:
               -> baseline = max(3200+300, 3700) = 3700
               -> ceil(3700/500)*500 = 4000 ft
     """
-    if not legs:
+    real_legs = [l for l in legs if not l.get("is_waypoint")]
+    if not real_legs:
         return 1000
-    max_terrain = max(leg["max_terrain_ft"] for leg in legs)
-    max_leg_min = max(leg["min_alt_ft"] for leg in legs)
+    max_terrain = max(leg["max_terrain_ft"] for leg in real_legs)
+    max_leg_min = max(leg["min_alt_ft"] for leg in real_legs)
     min_safe = max(max_terrain + 300, max_leg_min)
     return int(math.ceil(min_safe / 500) * 500)
 
 
 def compute_descent_leg(legs: list[dict],
-                        origin: dict,
-                        destination: dict,
+                        route_stops: list[dict],
                         cruise_speed_ias: float,
                         fuel_consumption_gph: float,
-                        ete_min: float,
+                        total_ete_min: float,
                         cruise_altitude_ft: Optional[int] = None) -> Optional[dict]:
     """
-    Calcula el tramo de inicio de descenso.
+    Calcula el tramo de inicio de descenso siguiendo la ruta de multiples
+    segmentos definida por route_stops (lista de dicts con lat/lon, el ultimo
+    siendo el destino).
       - Altitud crucero recomendada: máxima Alt.Mín de los tramos
       - Altitud objetivo sobre destino: elevación + 1000 ft AGL
       - Velocidad de descenso: 500 ft/min
@@ -574,33 +642,59 @@ def compute_descent_leg(legs: list[dict],
     Devuelve un dict con los mismos campos que los tramos normales
     más 'is_descent': True.
     """
-    if not legs:
+    if not legs or len(route_stops) < 2:
         return None
+
+    destination = route_stops[-1]
+    real_legs = [l for l in legs if not l.get("is_waypoint")]
 
     if cruise_altitude_ft is not None:
         cruise_alt_ft = cruise_altitude_ft
     else:
-        cruise_alt_ft = max(leg["min_alt_ft"] for leg in legs)
+        cruise_alt_ft = max(leg["min_alt_ft"] for leg in real_legs) if real_legs else 1000
     target_alt_ft = destination["elevation_ft"] + 1000   # 1000 ft AGL sobre destino
     alt_to_lose   = max(0.0, cruise_alt_ft - target_alt_ft)
     time_desc_min = alt_to_lose / 500.0                  # a 500 ft/min
     lead_time_min = time_desc_min + 2.0                  # + 2 min de margen antes del campo
 
-    descent_start_min = ete_min - lead_time_min
+    descent_start_min = total_ete_min - lead_time_min
     if descent_start_min <= 0:
-        descent_start_min = ete_min * 0.5
+        descent_start_min = total_ete_min * 0.5
 
-    fraction = min(descent_start_min / ete_min, 0.99)
-    lat, lon = intermediate_point(
-        origin["lat"], origin["lon"],
-        destination["lat"], destination["lon"],
-        fraction,
-    )
+    # Calcular ETE acumulado por segmento para encontrar el punto de inicio de descenso
+    speed_nm_per_min = cruise_speed_ias * KNOTS_TO_NM_PER_MIN
+    stop_etimes = [0.0]
+    for k in range(1, len(route_stops)):
+        seg_nm = gc_distance_nm(route_stops[k-1]["lat"], route_stops[k-1]["lon"],
+                                route_stops[k]["lat"],   route_stops[k]["lon"])
+        stop_etimes.append(stop_etimes[-1] + seg_nm / speed_nm_per_min)
+
+    # Encontrar el segmento que contiene descent_start_min
+    lat, lon = route_stops[-1]["lat"], route_stops[-1]["lon"]
+    for k in range(1, len(route_stops)):
+        if stop_etimes[k] >= descent_start_min:
+            seg_from    = route_stops[k - 1]
+            seg_to      = route_stops[k]
+            seg_start   = stop_etimes[k - 1]
+            seg_dur     = stop_etimes[k] - seg_start
+            if seg_dur > 0:
+                seg_frac = min((descent_start_min - seg_start) / seg_dur, 0.99)
+            else:
+                seg_frac = 0.99
+            lat, lon = intermediate_point(
+                seg_from["lat"], seg_from["lon"],
+                seg_to["lat"],   seg_to["lon"],
+                seg_frac,
+            )
+            break
+
     cumulative_fuel = round(fuel_consumption_gph * (descent_start_min / 60.0), 1)
 
     return {
+        "is_waypoint":     False,
         "leg_num":         0,
         "elapsed_min":     round(descent_start_min),
+        "_cumulative_min": descent_start_min,
         "lat":             lat,
         "lon":             lon,
         "landmark":        "\u25bc INICIO DESCENSO",
@@ -662,6 +756,9 @@ BODY_STYLE = _style("body",
 
 SMALL_STYLE = _style("small",
                      fontSize=6, fontName="Helvetica", leading=8)
+
+ALT_CELL_STYLE = _style("alt_cell",
+                        fontSize=5.5, fontName="Helvetica", leading=6)
 
 FREQ_TITLE_STYLE = _style("freq_title",
                           fontSize=9, fontName="Helvetica-Bold",
@@ -783,14 +880,14 @@ def draw_front_panel(c: canvas.Canvas,
     y -= apt_info_h + 2 * mm
 
     # ── Tabla de tramos ───────────────────────────────────────────────────────
-    # Columnas: T.Plan | Referencia | Alt.Min | C.plan | Alternativo | H.Real | C.Real
-    col_widths = [9 * mm, 34 * mm, 14 * mm, 11 * mm, 30 * mm, 17 * mm, 17 * mm]
+    # Columns: T.Plan | Track | Referencia | Alt.Mín | C.plan | Alternativo | H.Real | C.Real
+    col_widths = [9 * mm, 9 * mm, 34 * mm, 14 * mm, 11 * mm, 30 * mm, 12 * mm, 7 * mm]
     deficit = INNER_W - sum(col_widths)
     if deficit > 0:
-        col_widths[1] += deficit  # extra espacio a Referencia
+        col_widths[2] += deficit  # extra espacio a Referencia
 
     headers = [
-        "T.Plan\n(min)", "Referencia", "Alt.M\u00edn\n(ft)",
+        "T.Plan\n(min)", "Track\n(\u00b0M)", "Referencia", "Alt.M\u00edn\n(ft)",
         "C.plan\n(gal)", "Alternativo\n(ICAO/Frec)",
         "H. Real", "C. Real",
     ]
@@ -799,27 +896,71 @@ def draw_front_panel(c: canvas.Canvas,
     COL_DESCENT = colors.white    # sin relleno naranja
     COL_D_TEXT  = colors.black    # texto descenso en negro
 
-    # Combinar tramos ordinarios + tramo de descenso ordenados por tiempo
+    # Combinar tramos + tramo de descenso ordenados por tiempo acumulado.
+    # Los waypoint-markers ya vienen embebidos en `legs`, también ordenados.
     all_entries: list[dict] = []
     for leg in legs:
-        all_entries.append({"is_descent": False, "data": leg})
+        all_entries.append({
+            "is_descent":  False,
+            "is_waypoint": leg.get("is_waypoint", False),
+            "data":        leg,
+        })
     if descent_leg:
-        d_min = descent_leg["elapsed_min"]
+        d_cum = descent_leg.get("_cumulative_min", descent_leg["elapsed_min"])
         ins = len(all_entries)
         for i, e in enumerate(all_entries):
-            if e["data"]["elapsed_min"] >= d_min:
-                ins = i
-                break
-        all_entries.insert(ins, {"is_descent": True, "data": descent_leg})
+            if not e["is_waypoint"]:
+                e_cum = e["data"].get("_cumulative_min", e["data"]["elapsed_min"])
+                if e_cum >= d_cum:
+                    ins = i
+                    break
+        all_entries.insert(ins, {"is_descent": True, "is_waypoint": False, "data": descent_leg})
+
+    # Append final destination marker row (shows total ETE and distance)
+    try:
+        dest_marker = {
+            "is_waypoint": True,
+            "is_descent": False,
+            "data": {
+                "leg_num": 0,
+                "elapsed_min": int(round(ete_min)),
+                "_cumulative_min": ete_min,
+                "_cumulative_dist": total_nm,
+                "cum_dist_nm": round(total_nm, 1),
+                "lat": destination.get("lat"),
+                "lon": destination.get("lon"),
+                "landmark": f"\u25ba DEST: {destination.get('icao', '')}",
+            }
+        }
+        all_entries.append(dest_marker)
+    except Exception:
+        pass
 
     rows = [headers]
-    descent_row_idx: Optional[int] = None
+    descent_row_idx:  Optional[int] = None
+    waypoint_row_idxs: list[int]    = []
 
-    for entry in all_entries:
-        is_d = entry["is_descent"]
-        leg  = entry["data"]
+    for idx, entry in enumerate(all_entries):
+        is_d  = entry["is_descent"]
+        is_wp = entry["is_waypoint"]
+        leg   = entry["data"]
+
+        if is_wp:
+            # Waypoint marker: full-width spanning row with new heading
+            lm = leg.get("landmark", "")
+            # Append cumulative time and distance to the waypoint marker
+            cum_min = int(round(leg.get("_cumulative_min", 0)))
+            cum_dist = leg.get("cum_dist_nm", 0.0)
+            lm_full = f"{lm}  | T+{cum_min}min  {cum_dist:.1f}NM"
+            # Insert row with extra Track column (blank)
+            rows.append([lm_full, "", "", "", "", "", "", ""])
+            waypoint_row_idxs.append(len(rows) - 1)
+            continue
 
         lm = leg.get("landmark", "")
+        # Use the segment track (constant per segment) if available
+        track_val = leg.get("segment_track_mag")
+        track_str = f"{int(track_val):03d}\u00b0M" if track_val not in (None, "") else ""
         if not is_d and len(lm) > 22:
             lm = lm[:21] + "\u2026"
 
@@ -842,12 +983,21 @@ def draw_front_panel(c: canvas.Canvas,
             alt_l2 = ""
         # Linea 3: frecuencia
         alt_l3 = alt_freq if alt_freq else "___________"
-        alt_cell = "\n".join(filter(None, [alt_l1, alt_l2, alt_l3]))
+        alt_cell_text = "\n".join(filter(None, [alt_l1, alt_l2, alt_l3]))
+        alt_cell = Paragraph(alt_cell_text, ALT_CELL_STYLE)
+
+        # T.Plan: show cumulative time from origin for every row.
+        cum_min_val = int(round(leg.get("_cumulative_min", leg.get("elapsed_min", 0))))
+        if is_d:
+            t_plan_str = f"T+{cum_min_val}"
+        else:
+            t_plan_str = str(cum_min_val)
 
         rows.append([
-            str(leg["elapsed_min"]),
+            t_plan_str,
+            track_str,
             lm,
-            f"{leg['min_alt_ft']:,}",
+            f"{leg['min_alt_ft']:,}" if leg["min_alt_ft"] else "",
             str(leg.get("fuel_burned_gal", "")),
             alt_cell,
             "",   # H. Real – escritura manual
@@ -872,15 +1022,25 @@ def draw_front_panel(c: canvas.Canvas,
         ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
         ("LEFTPADDING",   (0, 0), (-1, -1), 2),
         ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
-        # Alineación izquierda en Referencia y Alternativo
-        ("ALIGN",         (1, 0), (1, -1), "LEFT"),
-        ("ALIGN",         (4, 0), (4, -1), "LEFT"),
+        # Alineación izquierda en Referencia (col 2) y Alternativo (col 5)
+        ("ALIGN",         (2, 0), (2, -1), "LEFT"),
+        ("ALIGN",         (5, 0), (5, -1), "LEFT"),
     ]
     if descent_row_idx is not None:
         style_cmds += [
-            ("FONTNAME",   (0, descent_row_idx), (4, descent_row_idx), "Helvetica-Bold"),
+            ("FONTNAME",   (0, descent_row_idx), (5, descent_row_idx), "Helvetica-Bold"),
             ("LINEABOVE",  (0, descent_row_idx), (-1, descent_row_idx), 0.5, colors.black),
             ("LINEBELOW",  (0, descent_row_idx), (-1, descent_row_idx), 0.5, colors.black),
+        ]
+    for wp_row in waypoint_row_idxs:
+        style_cmds += [
+            ("SPAN",       (0, wp_row), (-1, wp_row)),
+            ("FONTNAME",   (0, wp_row), (-1, wp_row), "Helvetica-Bold"),
+            ("FONTSIZE",   (0, wp_row), (-1, wp_row), 6),
+            ("ALIGN",      (0, wp_row), (-1, wp_row), "CENTER"),
+            ("BACKGROUND", (0, wp_row), (-1, wp_row), colors.HexColor("#EEEEEE")),
+            ("LINEABOVE",  (0, wp_row), (-1, wp_row), 0.8, colors.black),
+            ("LINEBELOW",  (0, wp_row), (-1, wp_row), 0.8, colors.black),
         ]
 
     tbl = Table(rows, colWidths=col_widths, repeatRows=1)
@@ -1088,10 +1248,12 @@ def generate_pdf(output_path: str,
       Pagina 2 – Dorso  : Panel de Frecuencias (rotado 180 grados) en el panel A5 derecho
                           (queda a la izquierda al girar la hoja y doblarla)
     """
-    # Deduplicar alternativas en ruta por ICAO
+    # Deduplicar alternativas en ruta por ICAO (omitir filas de waypoint)
     seen: set[str] = set()
     enroute: list[dict] = []
     for leg in legs:
+        if leg.get("is_waypoint"):
+            continue
         icao = leg.get("alt_icao", "\u2014")
         if icao not in seen and icao not in ("\u2014", origin["icao"], destination["icao"]):
             seen.add(icao)
@@ -1134,6 +1296,31 @@ def generate_pdf(output_path: str,
 # Main
 # ---------------------------------------------------------------------------
 
+def _parse_via(via_str: str) -> dict:
+    """
+    Parse a single --via argument string into a waypoint dict.
+    Accepted formats (case-insensitive):
+      NAME,lat,lon        e.g.  LONDON,51.514,-0.115
+      [NAME,lat,lon]      brackets tolerated
+    Returns {'name': str, 'lat': float, 'lon': float}.
+    Raises ValueError on bad input.
+    """
+    raw = via_str.strip().strip("[]")
+    parts = raw.split(",")
+    if len(parts) != 3:
+        raise ValueError(
+            f"--via waypoint must be NAME,lat,lon  (got: {via_str!r})"
+        )
+    name, lat_s, lon_s = parts
+    try:
+        return {"name": name.strip().upper(), "lat": float(lat_s), "lon": float(lon_s),
+                "elevation_ft": 0.0}
+    except ValueError:
+        raise ValueError(
+            f"--via lat/lon must be numeric  (got: {via_str!r})"
+        )
+
+
 def main() -> None:
     """Entry point – parse CLI arguments, fetch data, compute, generate PDF."""
     parser = argparse.ArgumentParser(
@@ -1148,6 +1335,14 @@ def main() -> None:
                         help="Fuel consumption in US gallons per hour")
     parser.add_argument("-o", "--output",   default=None,
                         help="Output PDF path (default: <ORIG>_<DEST>_vfr.pdf)")
+    parser.add_argument(
+        "--via", metavar="NAME,LAT,LON", action="append", default=[],
+        help=(
+            "Intermediate waypoint in format NAME,lat,lon  "
+            "(e.g. LONDON,51.514,-0.115).  Repeat for multiple waypoints "
+            "in order: departure → WP1 → WP2 → … → destination."
+        ),
+    )
     args = parser.parse_args()
 
     origin_icao  = args.origin_icao.upper().strip()
@@ -1156,9 +1351,17 @@ def main() -> None:
     fuel_gph     = args.fuel_consumption_gph
     output_path  = args.output or f"{origin_icao}_{dest_icao}_vfr.pdf"
 
+    # Parse intermediate waypoints
+    waypoints: list[dict] = []
+    for via_raw in args.via:
+        waypoints.append(_parse_via(via_raw))
+
+    via_str = "  →  ".join(wp["name"] for wp in waypoints) if waypoints else "(direct)"
     print(f"\n{'='*60}")
     print(f"  Generador de Hoja de Vuelo VFR")
     print(f"  {origin_icao} \u2192 {dest_icao}  |  {cruise_kts} kt  |  {fuel_gph} GPH")
+    if waypoints:
+        print(f"  Vía: {via_str}")
     print(f"{'='*60}\n")
 
     # 1. Datos de aeropuertos --------------------------------------------------
@@ -1167,6 +1370,9 @@ def main() -> None:
     destination = lookup_airport(dest_icao)
     print(f"  Origen:   {origin['name']}  ({origin['lat']:.4f}, {origin['lon']:.4f})  "
           f"Elev: {origin['elevation_ft']:.0f} ft")
+    if waypoints:
+        for wp in waypoints:
+            print(f"  Vía:      {wp['name']}  ({wp['lat']:.4f}, {wp['lon']:.4f})")
     print(f"  Destino:  {destination['name']}  ({destination['lat']:.4f}, "
           f"{destination['lon']:.4f})  Elev: {destination['elevation_ft']:.0f} ft")
 
@@ -1177,33 +1383,43 @@ def main() -> None:
 
     # 3. Calculo de navegacion -------------------------------------------------
     print("[3/5] Calculando navegacion...")
-    total_nm = gc_distance_nm(origin["lat"], origin["lon"],
-                              destination["lat"], destination["lon"])
-    tc       = bearing_to_destination(origin["lat"], origin["lon"],
-                                      destination["lat"], destination["lon"])
-    mag_var  = magnetic_variation(origin["lat"], origin["lon"])
-    mh       = (tc - mag_var + 360) % 360
-    ete_min  = (total_nm / cruise_kts) * 60
+    # Total route distance: sum of all segments
+    route_stops_nav = [origin] + waypoints + [destination]
+    total_nm = sum(
+        gc_distance_nm(route_stops_nav[k]["lat"], route_stops_nav[k]["lon"],
+                       route_stops_nav[k+1]["lat"], route_stops_nav[k+1]["lon"])
+        for k in range(len(route_stops_nav) - 1)
+    )
+    # Initial bearing and magnetic heading from origin
+    tc      = bearing_to_destination(origin["lat"], origin["lon"],
+                                     route_stops_nav[1]["lat"], route_stops_nav[1]["lon"])
+    mag_var = magnetic_variation(origin["lat"], origin["lon"])
+    mh      = (tc - mag_var + 360) % 360
+    ete_min = (total_nm / cruise_kts) * 60
     fuel_req = fuel_gph * (ete_min / 60)
 
-    print(f"  Distancia       : {total_nm:.1f} NM")
-    print(f"  Rumbo verdadero : {tc:.1f}\u00b0V")
-    print(f"  Var. magnetica  : {mag_var:+.1f}\u00b0  \u2192  RM: {mh:.1f}\u00b0M")
-    print(f"  TEE             : {ete_min:.0f} min")
+    print(f"  Distancia total : {total_nm:.1f} NM")
+    print(f"  Rumbo inicial   : {tc:.1f}\u00b0V  \u2192  {mh:.1f}\u00b0M")
+    print(f"  Var. magnetica  : {mag_var:+.1f}\u00b0")
+    print(f"  TEE total       : {ete_min:.0f} min")
     print(f"  Combustible req : {fuel_req:.1f} gal")
 
     # 4. Tramos de ruta --------------------------------------------------------
     print("[4/5] Construyendo tramos (terreno + referencias – puede tardar unos minutos)...")
-    legs = build_legs(origin, destination, cruise_kts, fuel_gph, mag_var)
+    legs = build_legs(origin, destination, cruise_kts, fuel_gph, mag_var,
+                      waypoints=waypoints)
 
     # 4b. Altitud de crucero recomendada --------------------------------------
     cruise_alt = recommended_cruise_altitude(legs)
+    real_legs  = [l for l in legs if not l.get("is_waypoint")]
+    max_terr   = max((l["max_terrain_ft"] for l in real_legs), default=0)
     print(f"  Altitud de crucero recomendada: {cruise_alt} ft  "
-          f"(terreno max: {max(l['max_terrain_ft'] for l in legs):.0f} ft)")
+          f"(terreno max: {max_terr:.0f} ft)")
 
     # 4c. Tramo de descenso ---------------------------------------------------
+    route_stops_full = [origin] + waypoints + [destination]
     descent_leg = compute_descent_leg(
-        legs, origin, destination, cruise_kts, fuel_gph, ete_min,
+        legs, route_stops_full, cruise_kts, fuel_gph, ete_min,
         cruise_altitude_ft=cruise_alt,
     )
     if descent_leg:

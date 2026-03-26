@@ -28,6 +28,52 @@ python3 vfr_onepager.py LEPP LEZG 100 10 -o trip.pdf
 - `CRUISE_KTS` : cruise speed in knots (IAS).
 - `FUEL_GPH` : fuel consumption in US gallons per hour.
 
+Advanced usage & examples
+-------------------------
+The script supports intermediate route waypoints (`--via`) and produces additional information in the trip log:
+
+- `Track` column: the constant magnetic heading for the current segment (origin → WP1, WP1 → WP2, … → destination).
+- `T.Plan`: time shown is cumulative minutes from origin (keeps `T+` prefix for the descent marker).
+- Waypoint marker rows: full-width shaded rows showing the waypoint name, cumulative time from origin and total distance flown so far.
+- Final destination marker: a shaded row at the end showing total ETE and total distance.
+
+Examples:
+
+```bash
+# Simple direct trip
+python3 vfr_onepager.py LEPP LEZG 100 10 -o trip.pdf
+
+# With two intermediate waypoints
+python3 vfr_onepager.py LEPP LEZG 110 6 \
+	--via "EMBALSE,42.09395134930251,-1.0864194804110534" \
+	--via "LUCENI,41.828027058802995,-1.2391816773319912" \
+	-o trip_via.pdf
+```
+
+Multiple waypoints (VIA)
+------------------------
+You can include intermediate waypoints using the `--via` option. Repeat `--via` for multiple points in the order you want them flown (origin → WP1 → WP2 → … → destination).
+
+Format: `NAME,lat,lon` (brackets optional). Examples:
+
+```bash
+# Single intermediate waypoint
+python3 vfr_onepager.py LEPP LEZG 110 6 --via "LONDON,51.51407373693925,-0.11524800056813268"
+
+# Multiple waypoints (order matters)
+python3 vfr_onepager.py LEPP LEZG 110 6 \
+	--via "LONDON,51.5140737,-0.1152480" \
+	--via "BRUSSELS,50.6738742,4.3744017" \
+	-o trip_via.pdf
+```
+
+Behavior notes:
+- The route is split into segments: ORIGIN → WP1 → WP2 → … → DEST.
+- Leg division (default 5-minute legs) resets at each waypoint so each segment is segmented independently.
+- The climb-time factor only applies to the very first leg of the entire route (departure).
+- Waypoint markers are shown as shaded full-width rows in the PDF with the new track (magnetic) to the next point.
+
+
 What the script does
 --------------------
 - Downloads OurAirports CSVs (airports, frequencies, runways).
@@ -36,6 +82,9 @@ What the script does
 - Calculates magnetic variation via the local geomag WMM library.
 - Builds legs (default 5-minute cruise legs). The first leg uses a climb-time factor (default `1.3`).
 - Recommends a cruise altitude (snapped to 500 ft steps) that is at least 300 ft above the highest terrain and not below any leg's minimum.
+- Adds a `Track` column with the per-segment magnetic heading and shows `T.Plan` as cumulative minutes from origin.
+- Inserts waypoint marker rows (with cumulative time/distance) and a final destination marker row in the trip table.
+
 
 Notes & tips
 -----------
@@ -48,6 +97,11 @@ Customization
 -------------
 - `LEG_MINUTES` and `CLIMB_SPEED_FACTOR` live near the top of `vfr_onepager.py` for easy tuning.
 - To require a minimum runway length for alternates, extend `closest_airport()` to cross-reference `runways.csv`.
+ 
+Output notes
+------------
+- The generated PDF is duplex A4 landscape with two A5 panels: the left front panel contains the trip log (Spanish labels), the right back panel contains frequency information.
+- The alternative cell layout was tightened to be more compact (smaller leading) to fit multi-line alternative entries.
 
 Caveats / Legal
 ---------------
