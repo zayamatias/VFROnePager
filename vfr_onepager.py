@@ -20,6 +20,7 @@ Dependencies (install with pip):
 
 import argparse
 import csv
+import datetime
 import io
 import math
 import sys
@@ -51,6 +52,7 @@ OURAIRPORTS_RUNWAYS_URL  = "https://davidmegginson.github.io/ourairports-data/ru
 OPEN_ELEVATION_URL       = "https://api.open-elevation.com/api/v1/lookup"
 OPEN_TOPO_DATA_URL       = "https://api.opentopodata.org/v1/srtm30m"  # fallback
 NOMINATIM_URL            = "https://nominatim.openstreetmap.org/reverse"
+OPEN_METEO_URL           = "https://api.open-meteo.com/v1/forecast"
 
 NM_PER_DEGREE   = 60.0          # 1° lat ≈ 60 NM
 FEET_PER_METER  = 3.28084
@@ -751,6 +753,204 @@ def compute_descent_leg(legs: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# Wind-effect calculation
+# ---------------------------------------------------------------------------
+
+def compute_wind_effect(tc_true: float, tas_kts: float,
+                        wind_from_deg: float, wind_speed_kts: float,
+                        total_nm: float, ete_no_wind_min: float) -> dict:
+    """
+    Calculate the effect of a steady wind on the route.
+
+    Parameters
+    ----------
+    tc_true        : True course of the route (degrees)
+    tas_kts        : True airspeed (knots) – we treat IAS ≈ TAS here
+    wind_from_deg  : Wind direction FROM (degrees true), e.g. 270 = westerly
+    wind_speed_kts : Wind speed (knots)
+    total_nm       : Total route distance (NM)
+    ete_no_wind_min: ETE without any wind (minutes)
+
+    Returns a dict with all values needed for the display box.
+    """
+    # Angle between wind-from and true course
+    # Headwind component: positive = headwind, negative = tailwind
+    angle_rad = math.radians(wind_from_deg - tc_true)
+    hw  = wind_speed_kts * math.cos(angle_rad)   # + headwind / - tailwind
+    xw  = wind_speed_kts * math.sin(angle_rad)   # + from right / - from left
+
+    # Wind Correction Angle (WCA) to maintain track
+    wca_rad = math.asin(max(-1.0, min(1.0, xw / tas_kts)))
+    wca_deg = math.degrees(wca_rad)              # negative = correct left
+
+    # Ground speed after correcting for crosswind
+    gs = tas_kts * math.cos(wca_rad) - hw
+    gs = max(1.0, gs)                            # safety floor
+
+    # Adjusted ETE
+    new_ete_min = (total_nm / gs) * 60.0
+    delta_min   = new_ete_min - ete_no_wind_min  # + = slower, - = faster
+
+    # Cross-track drift per 5 min if NO correction is applied
+    drift_nm_per_5 = xw * (5.0 / 60.0)          # NM sideways in 5 min
+
+    # Determine qualitative descriptions
+    if abs(hw) < 1.0:
+        hw_label = "Sin componente frontal/trasero"
+    elif hw > 0:
+        hw_label = f"Viento en cara  {hw:.0f} kt  → más lento"
+    else:
+        hw_label = f"Viento de cola  {abs(hw):.0f} kt  → más rápido"
+
+    if abs(xw) < 1.0:
+        xw_label = "Sin componente cruzada"
+    elif xw > 0:
+        xw_label = f"Cruzado desde la derecha  {abs(xw):.0f} kt"
+    else:
+        xw_label = f"Cruzado desde la izquierda  {abs(xw):.0f} kt"
+
+    wca_label = (
+        f"Corrección de rumbo: {abs(wca_deg):.1f}° a la "
+        + ("derecha" if wca_deg > 0 else "izquierda")
+    ) if abs(wca_deg) >= 0.5 else "Corrección de rumbo: insignificante"
+
+    drift_dir = "derecha" if drift_nm_per_5 > 0 else "izquierda"
+
+    return {
+        "wind_from":     wind_from_deg,
+        "wind_speed":    wind_speed_kts,
+        "hw":            hw,
+        "xw":            xw,
+        "wca_deg":       wca_deg,
+        "gs":            gs,
+        "new_ete_min":   new_ete_min,
+        "delta_min":     delta_min,
+        "drift_nm_per_5": abs(drift_nm_per_5),
+        "drift_dir":     drift_dir,
+        "hw_label":      hw_label,
+        "xw_label":      xw_label,
+        "wca_label":     wca_label,
+        "source":        "",          # filled by caller
+        "pressure_hpa":  "",          # filled by caller
+    }
+
+
+# ---------------------------------------------------------------------------
+# Open-Meteo real-time wind
+# ---------------------------------------------------------------------------
+
+def _alt_to_pressure_level(altitude_ft: float) -> str:
+    """
+    Map cruise altitude in feet to the nearest Open-Meteo pressure level.
+    Returns the level as a string, e.g. '850'.
+    """
+    if altitude_ft < 3_500:
+        return "925"
+    elif altitude_ft < 7_500:
+        return "850"
+    elif altitude_ft < 14_000:
+        return "700"
+    else:
+        return "500"
+
+
+def fetch_route_wind(lat: float, lon: float,
+                    altitude_ft: float) -> tuple[float, float, str]:
+    """
+    Fetch the current en-route wind from Open-Meteo at (lat, lon) and the
+    pressure level nearest to cruise altitude.
+
+    Returns (speed_kts, direction_from_deg_true, pressure_level_hpa_str).
+    Raises on network or data errors.
+    """
+    level   = _alt_to_pressure_level(altitude_ft)
+    spd_var = f"wind_speed_{level}hPa"
+    dir_var = f"wind_direction_{level}hPa"
+
+    params = {
+        "latitude":        round(lat, 4),
+        "longitude":       round(lon, 4),
+        "hourly":          f"{spd_var},{dir_var}",
+        "wind_speed_unit": "kn",
+        "timezone":        "UTC",
+        "forecast_days":   1,
+    }
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    hourly = data["hourly"]
+    times  = hourly["time"]       # list of "YYYY-MM-DDTHH:00" strings (UTC)
+    speeds = hourly[spd_var]
+    dirs   = hourly[dir_var]
+
+    # Pick the entry whose hour is closest to now (UTC)
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:00")
+    idx = times.index(now_str) if now_str in times else 0
+
+    speed = speeds[idx]
+    direction = dirs[idx]
+    if speed is None or direction is None:
+        raise ValueError(f"Open-Meteo returned null wind at index {idx}")
+
+    return float(speed), float(direction), level
+
+
+def fetch_winds_for_legs(legs: list[dict], altitude_ft: float) -> None:
+    """
+    Fetch real-time wind from Open-Meteo for every non-waypoint leg point
+    using a single batched API request.  Updates each leg dict in-place with:
+        leg["wind_speed_kt"]   – speed in knots
+        leg["wind_from_deg"]   – direction FROM in degrees true
+    Waypoint-marker legs are skipped (no lat/lon to query).
+    Falls back gracefully: legs without wind keep key absent.
+    """
+    level   = _alt_to_pressure_level(altitude_ft)
+    spd_var = f"wind_speed_{level}hPa"
+    dir_var = f"wind_direction_{level}hPa"
+
+    # Collect real legs only (skip waypoint-marker rows)
+    real_legs = [(i, leg) for i, leg in enumerate(legs)
+                 if not leg.get("is_waypoint") and "lat" in leg and "lon" in leg]
+    if not real_legs:
+        return
+
+    lats = ",".join(str(round(leg["lat"], 4)) for _, leg in real_legs)
+    lons = ",".join(str(round(leg["lon"], 4)) for _, leg in real_legs)
+
+    params = {
+        "latitude":        lats,
+        "longitude":       lons,
+        "hourly":          f"{spd_var},{dir_var}",
+        "wind_speed_unit": "kn",
+        "timezone":        "UTC",
+        "forecast_days":    1,
+    }
+    resp = requests.get(OPEN_METEO_URL, params=params, timeout=20)
+    resp.raise_for_status()
+    results = resp.json()   # list when multiple locations
+    if isinstance(results, dict):
+        results = [results]  # single-location fallback
+
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:00")
+
+    for (orig_idx, leg), loc_data in zip(real_legs, results):
+        try:
+            hourly = loc_data["hourly"]
+            times  = hourly["time"]
+            speeds = hourly[spd_var]
+            dirs   = hourly[dir_var]
+            t_idx  = times.index(now_str) if now_str in times else 0
+            spd    = speeds[t_idx]
+            drn    = dirs[t_idx]
+            if spd is not None and drn is not None:
+                leg["wind_speed_kt"]  = round(float(spd))
+                leg["wind_from_deg"]  = round(float(drn))
+        except Exception:
+            pass   # leave leg without wind keys on any error
+
+
+# ---------------------------------------------------------------------------
 # PDF generation (ReportLab)
 # ---------------------------------------------------------------------------
 
@@ -835,7 +1035,8 @@ def draw_front_panel(c: canvas.Canvas,
                      legs: list[dict],
                      descent_leg: Optional[dict],
                      cruise_alt_ft: int = 0,
-                     x_offset: float = 0.0) -> None:
+                     x_offset: float = 0.0,
+                     wind_effect: Optional[dict] = None) -> None:
     """
     Dibuja la Hoja de Vuelo VFR en el panel A5 izquierdo (en español).
     Incluye columnas de registro manual (H.Real, C.Real) y fila de descenso.
@@ -885,9 +1086,8 @@ def draw_front_panel(c: canvas.Canvas,
     # ── Info aeropuertos: 2 columnas paralelas ────────────────────────────────
     y = PAGE_H - hdr_h - 3 * mm
     col_half = INNER_W / 2
-    apt_info_h = 24 * mm
-
-    apt_info_h = 28 * mm
+    # 9 text lines × 3.8 mm step + padding to avoid overlap with the legs table
+    apt_info_h = 38 * mm
     for apt, freqs, label, x_off in [
         (origin,      origin_freqs, "SALIDA",  MARGIN),
         (destination, dest_freqs,   "LLEGADA", MARGIN + col_half + 1 * mm),
@@ -917,20 +1117,27 @@ def draw_front_panel(c: canvas.Canvas,
         c.drawString(x_off, yy, "GND:      " + (gnd_v  if gnd_v  else "____________"))
         yy -= 3.8 * mm
         c.drawString(x_off, yy, "ATIS:     " + (atis_v if atis_v else "____________"))
+        yy -= 3.8 * mm
+        # Wind / QNH / Squawk fields for manual writing (no long underscores)
+        c.drawString(x_off, yy, "Viento:")
+        yy -= 3.8 * mm
+        c.setFont("Helvetica", 6)
+        c.drawString(x_off, yy, "QNH: _____")
+        c.drawString(x_off + 32 * mm, yy, "Squawk: _____")
 
     y -= apt_info_h + 2 * mm
 
     # ── Tabla de tramos ───────────────────────────────────────────────────────
-    # Columns: T.Plan | Track | Referencia | Alt.Mín | C.plan | Alternativo | H.Real | C.Real
-    col_widths = [9 * mm, 9 * mm, 34 * mm, 14 * mm, 11 * mm, 30 * mm, 12 * mm, 7 * mm]
+    # Columns: T.Plan | Track | Referencia | Alt.Mín | C.plan | Viento | Alternativo | H.Real | C.Real
+    col_widths = [9 * mm, 9 * mm, 28 * mm, 13 * mm, 10 * mm, 14 * mm, 26 * mm, 11 * mm, 6 * mm]
     deficit = INNER_W - sum(col_widths)
     if deficit > 0:
         col_widths[2] += deficit  # extra espacio a Referencia
 
     headers = [
         "T.Plan\n(min)", "Track\n(\u00b0M)", "Referencia", "Alt.M\u00edn\n(ft)",
-        "C.plan\n(gal)", "Alternativo\n(ICAO/Frec)",
-        "H. Real", "C. Real",
+        "C.plan\n(gal)", "Viento\n(kt/\u00b0V)", "Alternativo\n(ICAO/Frec)",
+        "T", "C",
     ]
 
     COL_WRITEIN = colors.white    # sin relleno amarillo
@@ -993,8 +1200,8 @@ def draw_front_panel(c: canvas.Canvas,
             cum_min = int(round(leg.get("_cumulative_min", 0)))
             cum_dist = leg.get("cum_dist_nm", 0.0)
             lm_full = f"{lm}  | T+{cum_min}min  {cum_dist:.1f}NM"
-            # Insert row with extra Track column (blank)
-            rows.append([lm_full, "", "", "", "", "", "", ""])
+            # Insert row with extra columns (blank) – 9 cols now
+            rows.append([lm_full, "", "", "", "", "", "", "", ""])
             waypoint_row_idxs.append(len(rows) - 1)
             continue
 
@@ -1034,12 +1241,25 @@ def draw_front_panel(c: canvas.Canvas,
         else:
             t_plan_str = str(cum_min_val)
 
+        # Wind cell: "SPD / DIR°" – show if data available, else blank
+        ws = leg.get("wind_speed_kt")
+        wd = leg.get("wind_from_deg")
+        # Compact format: SS/CCC (speed/direction) to save space, e.g. 15/270
+        if ws is not None and wd is not None and not is_d:
+            try:
+                wind_cell = f"{int(round(ws))}/{int(round(wd)) :03d}"
+            except Exception:
+                wind_cell = f"{ws}/{wd}"
+        else:
+            wind_cell = ""
+
         rows.append([
             t_plan_str,
             track_str,
             lm,
             f"{leg['min_alt_ft']:,}" if leg["min_alt_ft"] else "",
             str(leg.get("fuel_burned_gal", "")),
+            wind_cell,
             alt_cell,
             "",   # H. Real – escritura manual
             "",   # C. Real – escritura manual
@@ -1063,19 +1283,19 @@ def draw_front_panel(c: canvas.Canvas,
         ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
         ("LEFTPADDING",   (0, 0), (-1, -1), 2),
         ("RIGHTPADDING",  (0, 0), (-1, -1), 2),
-        # Alineación izquierda en Referencia (col 2) y Alternativo (col 5)
+        # Alineación izquierda en Referencia (col 2) y Alternativo (col 6)
         ("ALIGN",         (2, 0), (2, -1), "LEFT"),
-        ("ALIGN",         (5, 0), (5, -1), "LEFT"),
+        ("ALIGN",         (6, 0), (6, -1), "LEFT"),
     ]
     if descent_row_idx is not None:
         style_cmds += [
-            ("FONTNAME",   (0, descent_row_idx), (5, descent_row_idx), "Helvetica-Bold"),
+            ("FONTNAME",   (0, descent_row_idx), (6, descent_row_idx), "Helvetica-Bold"),
             ("LINEABOVE",  (0, descent_row_idx), (-1, descent_row_idx), 0.5, colors.black),
             ("LINEBELOW",  (0, descent_row_idx), (-1, descent_row_idx), 0.5, colors.black),
         ]
     for wp_row in waypoint_row_idxs:
         style_cmds += [
-            ("SPAN",       (0, wp_row), (-1, wp_row)),
+            ("SPAN",       (0, wp_row), (8, wp_row)),  # span all 9 cols
             ("FONTNAME",   (0, wp_row), (-1, wp_row), "Helvetica-Bold"),
             ("FONTSIZE",   (0, wp_row), (-1, wp_row), 6),
             ("ALIGN",      (0, wp_row), (-1, wp_row), "CENTER"),
@@ -1095,6 +1315,84 @@ def draw_front_panel(c: canvas.Canvas,
         frame.drawOn(c, MARGIN, y - h)
     else:
         tbl.drawOn(c, MARGIN, y - h)
+
+    # ── Viento proyectado ───────────────────────────────────────────────────
+    if wind_effect:
+        we = wind_effect
+        wind_box_h = 18 * mm
+        wy = MARGIN + 6 * mm + wind_box_h   # top of the wind box
+
+        # Thin border box
+        c.setStrokeColor(COL_BORDER)
+        c.setLineWidth(0.4)
+        c.rect(MARGIN, MARGIN + 6 * mm, INNER_W, wind_box_h)
+
+        # Header
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 6)
+        src_tag  = we.get("source", "")
+        lvl_tag  = we.get("pressure_hpa", "")
+        src_str  = f" [{src_tag} {lvl_tag} hPa]" if lvl_tag else (f" [{src_tag}]" if src_tag else "")
+        c.drawString(MARGIN + 2 * mm, wy - 3 * mm,
+                     f"VIENTO EN RUTA{src_str}  \u2014  "
+                     f"{we['wind_speed']:.0f} kt desde {we['wind_from']:.0f}\u00b0V  "
+                     f"(RC verdadero: {tc:.0f}\u00b0V)")
+
+        # Disclaimer
+        c.setFont("Helvetica-Oblique", 5)
+        c.setFillColor(colors.HexColor("#555555"))
+        disclaimer = ("\u26a0 Tiempo real Open-Meteo \u2013 verificar antes del vuelo"
+                      if src_tag == "Open-Meteo"
+                      else "\u26a0 MANUAL \u2013 el viento real puede cambiar en cualquier momento")
+        c.drawRightString(MARGIN + INNER_W - 2 * mm, wy - 3 * mm, disclaimer)
+
+        # Separator line under header
+        c.setStrokeColor(colors.HexColor("#AAAAAA"))
+        c.setLineWidth(0.3)
+        c.line(MARGIN, wy - 4.5 * mm, MARGIN + INNER_W, wy - 4.5 * mm)
+
+        # Three columns of data
+        c.setFont("Helvetica", 5.5)
+        c.setFillColor(colors.black)
+        col3 = INNER_W / 3
+        cx1 = MARGIN + 2 * mm
+        cx2 = MARGIN + col3 + 2 * mm
+        cx3 = MARGIN + 2 * col3 + 2 * mm
+        line_h = 3.4 * mm
+        ly = wy - 7 * mm
+
+        # Col 1: headwind / tailwind and ground speed
+        c.drawString(cx1, ly, we["hw_label"])
+        ly -= line_h
+        c.drawString(cx1, ly, f"Vel. sobre tierra (GS): {we['gs']:.0f} kt")
+        ly -= line_h
+        delta_sign = "+" if we["delta_min"] >= 0 else ""
+        c.drawString(cx1, ly,
+                     f"TEE ajustado: {int(round(we['new_ete_min']))} min "
+                     f"({delta_sign}{we['delta_min']:.0f} min)")
+
+        # Col 2: crosswind / correction
+        ly = wy - 7 * mm
+        c.drawString(cx2, ly, we["xw_label"])
+        ly -= line_h
+        c.drawString(cx2, ly, we["wca_label"])
+        ly -= line_h
+        c.drawString(cx2, ly,
+                     f"Sin correcc.: deriva {we['drift_nm_per_5']:.1f} NM/5 min "
+                     f"a la {we['drift_dir']}")
+
+        # Col 3: magnetic headings
+        ly = wy - 7 * mm
+        wca_mag = we["wca_deg"]
+        new_mh = (mh + wca_mag + 360) % 360
+        c.drawString(cx3, ly, f"RM sin viento: {mh % 360:.0f}\u00b0M")
+        ly -= line_h
+        c.drawString(cx3, ly, f"RM corregido:  {new_mh:.0f}\u00b0M")
+        ly -= line_h
+        c.drawString(cx3, ly,
+                     f"WCA: {abs(wca_mag):.1f}\u00b0 a la "
+                     + ("der." if wca_mag > 0 else "izq."))
+
 
     # ── Pie de p\u00e1gina ─────────────────────────────────────────────────────────
     c.setFont("Helvetica", 5)
@@ -1186,6 +1484,13 @@ def draw_back_panel(c: canvas.Canvas,
         c.drawString(MARGIN, y,
                      "Pistas: " + (rwys if rwys else "____________") +
                      f"    Elev: {apt.get('elevation_ft', 0):.0f} ft")
+        y -= 5 * mm
+        # Wind / QNH / Squawk fields for manual writing (no long underscores)
+        c.setFont("Helvetica", 6)
+        c.drawString(MARGIN, y, "Viento:")
+        y -= 4.5 * mm
+        c.drawString(MARGIN, y, "QNH: _____")
+        c.drawString(MARGIN + 32 * mm, y, "Squawk: _____")
         y -= 5 * mm
 
         col_w = [18 * mm, INNER_W - 18 * mm - 24 * mm, 24 * mm]
@@ -1292,7 +1597,8 @@ def generate_pdf(output_path: str,
                  total_nm: float, ete_min: float,
                  fuel_required_gal: float,
                  cruise_alt_ft: int = 0,
-                 one_face: bool = False) -> None:
+                 one_face: bool = False,
+                 wind_effect: Optional[dict] = None) -> None:
     """
     Genera un PDF duplex de dos paginas en A4 apaisado:
       Pagina 1 – Frontal: Hoja de Vuelo VFR en el panel A5 izquierdo
@@ -1324,6 +1630,7 @@ def generate_pdf(output_path: str,
             origin_freqs, dest_freqs, legs, descent_leg,
             cruise_alt_ft=cruise_alt_ft,
             x_offset=0,
+            wind_effect=wind_effect,
         )
         # Back panel unrotated on the right half
         draw_back_panel(
@@ -1343,6 +1650,7 @@ def generate_pdf(output_path: str,
             origin_freqs, dest_freqs, legs, descent_leg,
             cruise_alt_ft=cruise_alt_ft,
             x_offset=0,
+            wind_effect=wind_effect,
         )
         draw_fold_guide(c)
         c.showPage()
@@ -1420,6 +1728,14 @@ def main() -> None:
         help=("Render both front and back panels side-by-side on a single A4 face "
               "(useful for single-sided printing / preview)."),
     )
+    parser.add_argument(
+        "--wind", metavar="SPEED/DIR", default=None,
+        help=(
+            "Average en-route wind for projection, e.g. '15/270' meaning 15 kt from 270°. "
+            "Adds a projected wind-effect box at the bottom of the trip page. "
+            "Marked as estimated – real wind can change at any time."
+        ),
+    )
     args = parser.parse_args()
 
     origin_icao  = args.origin_icao.upper().strip()
@@ -1427,6 +1743,17 @@ def main() -> None:
     cruise_kts   = args.cruise_speed_ias
     fuel_gph     = args.fuel_consumption_gph
     output_path  = args.output or f"{origin_icao}_{dest_icao}_vfr.pdf"
+
+    # Parse optional manual wind override (--wind SPEED/DIR)
+    wind_override_speed: Optional[float] = None
+    wind_override_dir:   Optional[float] = None
+    if args.wind:
+        try:
+            ws_s, wd_s = args.wind.split("/")
+            wind_override_speed = float(ws_s.strip())
+            wind_override_dir   = float(wd_s.strip()) % 360
+        except ValueError:
+            parser.error("--wind must be SPEED/DIR, e.g. 15/270")
 
     # Parse intermediate waypoints
     waypoints: list[dict] = []
@@ -1503,8 +1830,69 @@ def main() -> None:
         print(f"  Inicio descenso: min {descent_leg['elapsed_min']} "
               f"(alt crucero {descent_leg['min_alt_ft']} ft)")
 
+    # 4d. Viento en ruta -------------------------------------------------------
+    wind_speed_kts: Optional[float] = None
+    wind_from_deg:  Optional[float] = None
+    wind_source = ""
+    wind_level  = ""
+
+    if wind_override_speed is not None:
+        # Manual override via --wind flag
+        wind_speed_kts = wind_override_speed
+        wind_from_deg  = wind_override_dir
+        wind_source    = "Manual"
+        print(f"  Viento manual: {wind_speed_kts:.0f} kt / {wind_from_deg:.0f}\u00b0V")
+    else:
+        # Auto-fetch: (a) per-leg winds for the table column,
+        #             (b) midpoint wind for the summary effect box
+        print("[4d] Consultando viento por tramo (Open-Meteo)...", flush=True)
+        try:
+            fetch_winds_for_legs(legs, cruise_alt)
+            # Use the midpoint leg's wind (or average) for the summary box
+            real_winds = [
+                (l["wind_speed_kt"], l["wind_from_deg"])
+                for l in legs
+                if not l.get("is_waypoint")
+                and "wind_speed_kt" in l and "wind_from_deg" in l
+            ]
+            if real_winds:
+                # Compute vector (u,v) average to correctly average wind directions
+                # Convert "from" direction to "to" vector by adding 180°.
+                sum_u = 0.0
+                sum_v = 0.0
+                for s, d in real_winds:
+                    theta_to = math.radians((d + 180) % 360)
+                    sum_u += s * math.cos(theta_to)
+                    sum_v += s * math.sin(theta_to)
+                n = len(real_winds)
+                mean_u = sum_u / n
+                mean_v = sum_v / n
+                # Resultant mean vector (to); convert back to a "from" direction
+                mean_speed = math.hypot(mean_u, mean_v)
+                dir_to_deg = (math.degrees(math.atan2(mean_v, mean_u))) % 360
+                wind_speed_kts = mean_speed
+                wind_from_deg = (dir_to_deg + 180) % 360
+                wind_level     = _alt_to_pressure_level(cruise_alt)
+                wind_source    = "Open-Meteo"
+                print(f"  Viento medio por tramos ({wind_level} hPa): "
+                      f"{wind_speed_kts:.0f} kt desde {wind_from_deg:.0f}\u00b0V "
+                      f"(n={n})")
+        except Exception as exc:
+            print(f"  [warn] Open-Meteo no disponible: {exc}", file=sys.stderr)
+
     # 5. Generar PDF -----------------------------------------------------------
     print("[5/5] Generando PDF...")
+    wind_effect = None
+    if wind_speed_kts is not None and wind_from_deg is not None:
+        wind_effect = compute_wind_effect(
+            tc, cruise_kts, wind_from_deg, wind_speed_kts, total_nm, ete_min
+        )
+        wind_effect["source"]       = wind_source
+        wind_effect["pressure_hpa"] = wind_level
+        print(f"  Efecto viento: GS {wind_effect['gs']:.0f} kt  "
+              f"TEE ajustado {int(round(wind_effect['new_ete_min']))} min "
+              f"({'+' if wind_effect['delta_min'] >= 0 else ''}"
+              f"{wind_effect['delta_min']:.0f} min)")
     generate_pdf(
         output_path,
         origin, destination,
@@ -1515,6 +1903,7 @@ def main() -> None:
         total_nm, ete_min, fuel_req,
         cruise_alt_ft=cruise_alt,
         one_face=args.one_face,
+        wind_effect=wind_effect,
     )
 
     print(f"\nListo. Abrir '{output_path}' e imprimir duplex (voltear por borde largo).\n")
