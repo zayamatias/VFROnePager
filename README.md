@@ -77,6 +77,11 @@ Behavior notes:
 - The climb-time factor only applies to the very first leg of the entire route (departure).
 - Waypoint markers are shown as shaded full-width rows in the PDF with the new track (magnetic) to the next point.
 
+- Wind averaging: per-leg winds (shown in the trip table) are averaged using a
+	vector mean (u,v) to produce a single representative wind speed and a
+	``from`` direction for the summary box. This avoids incorrect results when
+	averaging circular directions arithmetically.
+
  - Alternate entries now include airport elevation (e.g. "Elev: 1234 ft") when available.
 
 
