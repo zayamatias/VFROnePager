@@ -91,7 +91,9 @@ What the script does
 - Samples terrain along the route via Open-Elevation to compute leg minimums.
 - Queries Nominatim/OSM for short landmark names (rate-limited to 1 req/s).
 - Calculates magnetic variation via the local geomag WMM library.
-- Builds legs (default 5-minute cruise legs). The first leg uses a climb-time factor (default `1.3`).
+- Builds legs (default 5-minute cruise legs). The first real leg's duration is adjusted to represent
+	climb time to the recommended cruise altitude (computed from origin elevation and `--climb-rate`);
+	you can also override the leg interval with `--leg-minutes`.
 - Recommends a cruise altitude (snapped to 500 ft steps) that is at least 300 ft above the highest terrain and not below any leg's minimum.
 - Adds a `Track` column with the per-segment magnetic heading and shows `T.Plan` as cumulative minutes from origin.
 - Inserts waypoint marker rows (with cumulative time/distance) and a final destination marker row in the trip table.
@@ -104,6 +106,12 @@ Notes & tips
 - If an alternate airport shows no frequency, it is because OurAirports has no registered freq for that field. The script now prefers alternates that have at least one frequency.
 - The generated PDF filename defaults to `<ORIG>_<DEST>_vfr.pdf` if `-o` is not provided.
 
+Additional behavior and CLI options
+----------------------------------
+- `--leg-minutes`: override the default leg interval (minutes) used to split the route into legs (default: 5). Useful to produce coarser or finer leg tables.
+- `--climb-rate`: climb rate in ft/min (default: 500). The script computes climb time from origin elevation to the recommended cruise altitude and adjusts the first real leg's elapsed time and fuel accordingly; this affects total ETE and fuel required displayed in the plan.
+- First leg handling: the first real leg's elapsed time represents the time to reach cruise altitude (computed from `--climb-rate` and origin elevation) rather than a fixed-leg interval; this replaces the earlier fixed climb-factor behaviour.
+
 Customization
 -------------
 - `LEG_MINUTES` and `CLIMB_SPEED_FACTOR` live near the top of `vfr_onepager.py` for easy tuning.
@@ -114,6 +122,8 @@ Output notes
 - The generated PDF defaults to duplex A4 landscape with two A5 panels: the first page is the front panel, the second page is the back panel. The back panel is drawn unrotated so a normal duplex printer should print it on the back of page 1.
 - The `--one-face` flag renders both panels side-by-side on a single A4 page for single-sided previewing or quick checks.
 - The alternative cell layout was tightened to be more compact (smaller leading) to fit multi-line alternative entries; alternates also show elevation when available.
+
+- `Viento` column format: the trip table's wind column now shows two lines when wind data is available: top line `SS/DDD` (speed/direction FROM in degrees true) and bottom line `HW/CW` where `HW` is the head/tail component (negative = headwind/slows, positive = tailwind/adds speed) and `CW` is the signed crosswind (negative = from left, positive = from right).
 
 Caveats / Legal
 ---------------
