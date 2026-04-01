@@ -778,9 +778,37 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
     When no candidate sits in the left half-plane, the full candidate list is used
     (better to show something than nothing).
     """
-    radius_m = int(radius_nm * 1852)
-    candidates = _query_overpass(lat, lon, radius_m=radius_m)
+    # Iteratively expand search radius if no suitable left-side candidate is found.
+    max_radius_nm = 20.0
+    search_radii_nm = []
+    r = float(radius_nm)
+    while r <= max_radius_nm:
+        search_radii_nm.append(r)
+        r *= 2.0
+    # ensure the original radius is first and cap list
+    search_radii_nm = sorted(set(search_radii_nm), key=lambda x: x)
+
+    # Aggregate candidates across increasing radii (prefer left-side matches even at larger range)
+    candidates_all = []
+    for r_nm in search_radii_nm:
+        radius_m = int(r_nm * 1852)
+        try:
+            found = _query_overpass(lat, lon, radius_m=radius_m)
+        except Exception:
+            found = []
+        if found:
+            candidates_all.extend(found)
+        # If we already have any left-side candidate among accumulated, stop expanding
+        if track_deg is not None and ac_lat is not None and ac_lon is not None and candidates_all:
+            try:
+                any_left = any(180 <= ((bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"]) - track_deg + 360) % 360) < 360 for c in candidates_all)
+            except Exception:
+                any_left = False
+            if any_left:
+                break
+    candidates = candidates_all
     if not candidates:
+        # no POIs found in any radius — fall back to reverse-geocode
         return get_landmark(lat, lon, zoom=zoom), lat, lon
 
     def _rel_bearing(c) -> float:
@@ -830,19 +858,22 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
                 pass
         return base
 
-    # If track info is available, restrict to left-of-track candidates.
+    # If track info is available, prefer candidates on the LEFT of track.
+    # Strategy: prefer AHEAD-LEFT (270..360) first, then BEHIND-LEFT (180..270).
+    # Only fall back to the full candidate set when there is literally no POI
+    # on the left side at all.
     if track_deg is not None and ac_lat is not None and ac_lon is not None:
         try:
-            left_candidates = [
-                c for c in candidates
-                if 180 <= _rel_bearing(c) < 360
-            ]
+            ahead_left = [c for c in candidates if 270 <= _rel_bearing(c) < 360]
+            behind_left = [c for c in candidates if 180 <= _rel_bearing(c) < 270]
         except Exception:
-            left_candidates = []
-        # Only use the filtered list if it actually contains candidates.
-        if left_candidates:
-            candidates = left_candidates
-        # else: nothing on the left at all — keep full list as a last resort
+            ahead_left = []
+            behind_left = []
+        if ahead_left:
+            candidates = ahead_left
+        elif behind_left:
+            candidates = behind_left
+        # else: keep full list as a last resort (no POIs on the left at all)
 
     # Evaluate visibility: prefer candidates that are not clearly occluded by terrain
     visible = []
@@ -878,7 +909,32 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
     label = best.get("name")
     poi_lat = best.get("lat", lat)
     poi_lon = best.get("lon", lon)
-    return (label[:40] if label else get_landmark(lat, lon, zoom=zoom), poi_lat, poi_lon)
+    # derive a simple poi_type from tags for iconography
+    tags = best.get("tags", {})
+    if tags.get("natural") == "peak":
+        poi_type = "peak"
+    elif tags.get("water") == "lake" or tags.get("natural") == "water":
+        poi_type = "lake"
+    elif tags.get("waterway") == "river":
+        poi_type = "river"
+    elif tags.get("tourism") == "viewpoint":
+        poi_type = "viewpoint"
+    elif tags.get("aeroway") in ("aerodrome", "airport"):
+        poi_type = "airport"
+    elif "historic" in tags:
+        poi_type = "historic"
+    elif tags.get("man_made") == "water_tower":
+        poi_type = "water_tower"
+    elif tags.get("amenity") == "place_of_worship":
+        poi_type = "place_of_worship"
+    else:
+        place = tags.get("place", "")
+        if place in ("city", "town", "village", "hamlet"):
+            poi_type = "town"
+        else:
+            poi_type = "poi"
+
+    return (label[:40] if label else get_landmark(lat, lon, zoom=zoom), poi_lat, poi_lon, poi_type)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,13 +1070,14 @@ def build_legs(origin: dict, destination: dict,
             # are the actual OSM node coordinates, NOT the search centre.
             # Pass track_deg + aircraft position so it can filter to left-of-track only.
             try:
-                landmark, _lm_lat_store, _lm_lon_store = find_best_landmark(
+                landmark, _lm_lat_store, _lm_lon_store, _lm_type = find_best_landmark(
                     lm_lat, lm_lon, zoom=12, radius_nm=6.0,
                     track_deg=track_deg, ac_lat=lat, ac_lon=lon)
             except Exception:
                 landmark = get_landmark(lm_lat, lm_lon, zoom=12)
                 _lm_lat_store = lm_lat
                 _lm_lon_store = lm_lon
+                _lm_type = "poi"
 
             # Alternativa mas cercana (excluyendo origen y destino)
             alt = closest_airport(lat, lon,
@@ -1070,6 +1127,7 @@ def build_legs(origin: dict, destination: dict,
                 "alt_runways":      alt["runways"],
                 "lm_lat":           _lm_lat_store,
                 "lm_lon":           _lm_lon_store,
+                "lm_type":          _lm_type,
             })
 
             prev_lat, prev_lon = lat, lon
@@ -2234,7 +2292,7 @@ def _rotate_point_cw(px: float, py: float, cx: float, cy: float,
 def _build_tile_image(leg_lat: float, leg_lon: float,
                       bearing_deg: float,
                       lm_lat: float, lm_lon: float,
-                      lm_label: str,
+                      lm_label: str, lm_type: str,
                       leg_num: int, cum_min: int,
                       is_dest: bool = False):
     """
@@ -2415,6 +2473,37 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
             except Exception:
                 _font = ImageFont.load_default()
 
+        # Small pictogram/icon near the landmark dot based on `lm_type`.
+        try:
+            icon_map = {
+                "peak":       ("P", (180, 80, 0)),
+                "lake":       ("L", (0, 120, 200)),
+                "river":      ("R", (0, 120, 200)),
+                "viewpoint":  ("V", (255, 200, 0)),
+                "airport":    ("A", (60, 60, 60)),
+                "historic":   ("H", (150, 75, 0)),
+                "water_tower":("T", (120, 120, 120)),
+                "place_of_worship": ("+", (120, 0, 80)),
+                "town":       ("t", (80, 80, 80)),
+                "poi":        ("•", (80, 80, 80)),
+            }
+            ch, col = icon_map.get(lm_type, icon_map["poi"])
+            icon_r = 10
+            ix = lx_i + R2 + icon_r + 4
+            iy = ly_i - icon_r
+            if ix + icon_r > TILE_DISPLAY_PX - 6:
+                ix = lx_i - R2 - icon_r - 4
+            draw.ellipse([ix - icon_r, iy - icon_r, ix + icon_r, iy + icon_r],
+                         fill=(col[0], col[1], col[2], 230), outline=(255, 255, 255, 255), width=2)
+            try:
+                _ifont = _font if _font is not None else ImageFont.load_default()
+                w_ch, h_ch = _ifont.getsize(ch)
+                draw.text((ix - w_ch / 2, iy - h_ch / 2), ch, font=_ifont, fill=(255, 255, 255, 255))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         # Measure text (getbbox preferred; fall back to getsize for older Pillow)
         try:
             _bb = _font.getbbox(lm_short)
@@ -2590,7 +2679,8 @@ def draw_leg_tiles_page(c: canvas.Canvas, legs: list, data: "FlightData",
               f"brg={bearing:.0f}° → {'DEST' if is_dest else f'T+{cum_min}min'}…",
               end="", flush=True)
         img = _build_tile_image(leg_lat, leg_lon, bearing, lm_lat, lm_lon,
-                                 lm_label, leg_num, cum_min, is_dest=is_dest)
+                     lm_label, leg.get("lm_type", "poi"),
+                     leg_num, cum_min, is_dest=is_dest)
         if img is None:
             print(" sin imagen", flush=True)
             c.setStrokeColor(colors.lightgrey)
