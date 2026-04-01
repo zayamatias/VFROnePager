@@ -9,7 +9,7 @@ Generates a VFR trip one-pager as a duplex A4-landscape PDF.
 
 Data sources (all free, no API key required):
   - Airport/frequency data : OurAirports CSV  (https://ourairports.com/data/)
-  - Terrain elevation       : Open-Elevation API (https://api.open-elevation.com/)
+  - Terrain elevation       : SRTM3 HGT tiles (auto-downloaded from USGS, cached locally)
   - Reverse geocoding       : Nominatim / OpenStreetMap
   - Magnetic variation      : NOAA WMM via the 'geomag' library (local)
   - Great-circle math       : geopy
@@ -19,12 +19,17 @@ Dependencies (install with pip):
 """
 
 import argparse
+import array as _array_mod
 import csv
 import datetime
+import gzip as _gzip
 import io
 import math
 import sys
 import time
+import json
+import zipfile as _zipfile
+from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
@@ -60,6 +65,27 @@ KNOTS_TO_NM_PER_MIN = 1.0 / 60  # 1 kt = 1 NM/h = 1/60 NM/min
 LEG_MINUTES       = 5           # leg interval in minutes (cruise)
 CLIMB_SPEED_FACTOR = 1.3        # cruise_speed / climb_speed (first leg)
 TERRAIN_BUFFER_FT = 500         # recommended min altitude above terrain
+
+# --- Leg tile minimap constants ---
+import os as _os
+# CARTO basemap URLs – kept as two separate layers so we can rotate the
+# geometry (basemap) while keeping text labels horizontal.
+# Both layers are freely usable without an API key (CARTO free tier).
+OSM_TILE_URL        = "https://a.basemaps.cartocdn.com/rastertiles/voyager_nolabels/{z}/{x}/{y}.png"
+OSM_TILE_URL_LABELS = "https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png"
+OSM_TILE_ZOOM      = 12          # zoom level for leg tiles (good detail/speed balance)
+TILE_CACHE_DIR     = _os.path.join(_os.path.expanduser("~"), ".vfr_tile_cache")
+DEM_CACHE_DIR      = _os.path.join(TILE_CACHE_DIR, "dem")  # SRTM3 HGT tiles
+TILE_DISPLAY_NM    = 10.0        # geographic coverage per tile side (NM)
+TILE_DISPLAY_PX    = 560         # rendered pixels per tile side
+TILE_CHKPT_X_FRAC  = 0.65        # checkpoint horiz pos (from left); track displaced right
+TILE_CHKPT_Y_FRAC  = 0.55        # checkpoint vert pos (from top); near midpoint, look ahead
+
+# Overpass endpoint state (simple in-memory rate-limiter / cooldown)
+OVERPASS_ENDPOINT_COOLDOWN_SEC = 60   # seconds to cool an endpoint after failure
+OVERPASS_STATE = {}  # maps endpoint -> last_failed_timestamp
+
+_DEM_TILE_CACHE: dict = {}  # tile_name -> (array.array of int16, n) — in-memory tile cache
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -191,6 +217,56 @@ def runways_str(airport_id: str, icao: str) -> str:
     """Cadena compacta de pistas, p.ej. '09/27 · 03/21'.  Devuelve '' si no hay datos."""
     rwys = get_airport_runways(airport_id, icao)
     return " · ".join(rwys) if rwys else ""
+
+
+def best_departure_runway_mag(airport_id: str, icao: str,
+                               wind_from_deg_true: float,
+                               mag_var: float = 0.0) -> Optional[float]:
+    """
+    Return the magnetic heading of the runway end with the most headwind
+    (i.e. whose true heading is closest to the wind direction).
+    Returns None if no runway data with headings is available.
+    """
+    best_hdg_true: Optional[float] = None
+    best_hw: float = -999.0
+    best_is_mag: bool = False
+    for row in get_runways_data():
+        if row.get("airport_ident", "").upper() != icao.upper() and \
+           row.get("airport_ref", "") != airport_id:
+            continue
+        for hdg_key, ident_key in (("le_heading_degT", "le_ident"),
+                                    ("he_heading_degT", "he_ident")):
+            raw = row.get(hdg_key, "").strip()
+            if raw:
+                try:
+                    hdg_true = float(raw)
+                except ValueError:
+                    continue
+                is_mag = False  # OurAirports stores true headings
+            else:
+                # Fallback: derive heading from runway designator (e.g. "11" → 110°M)
+                ident = row.get(ident_key, "").strip()
+                num_str = "".join(c for c in ident if c.isdigit())
+                if not num_str:
+                    continue
+                num = int(num_str)
+                if not 1 <= num <= 36:
+                    continue
+                hdg_true = num * 10.0
+                is_mag = True  # designator is already magnetic
+            # Headwind component: positive = into wind (preferred)
+            # For true headings adjust by mag_var; for magnetic headings compare directly
+            wind_from = wind_from_deg_true if not is_mag else (wind_from_deg_true - mag_var + 360) % 360
+            hw = math.cos(math.radians(wind_from - hdg_true))
+            if hw > best_hw:
+                best_hw = hw
+                best_hdg_true = hdg_true
+                best_is_mag = is_mag
+    if best_hdg_true is None:
+        return None
+    if best_is_mag:
+        return best_hdg_true  # already magnetic
+    return (best_hdg_true - mag_var + 360) % 360
 
 
 def lookup_airport(icao: str) -> dict:
@@ -334,65 +410,165 @@ def closest_airport(lat: float, lon: float,
 
 
 # ---------------------------------------------------------------------------
-# Terrain elevation (Open-Elevation API with Open-Topo-Data fallback)
+# Terrain elevation — local SRTM1 HGT tiles (auto-downloaded on first use)
 # ---------------------------------------------------------------------------
+# SRTM1 tiles: 1°×1°, 3601×3601 big-endian int16 grid, ~25 MB raw / ~10 MB gzip.
+# Tiles are cached to DEM_CACHE_DIR and read directly without any API call.
+# Source: AWS Open Data elevation-tiles-prod (free, no registration, no API key).
+# Falls back to Open-Topo-Data API only if tile download fails.
 
-def _get_elevations_open_elevation(locations: list[dict]) -> list[float]:
-    """Try Open-Elevation. Returns elevations in metres or raises on failure."""
-    resp = requests.post(
-        OPEN_ELEVATION_URL,
-        json={"locations": locations},
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    results = data["results"]
-    if len(results) != len(locations):
-        raise ValueError(f"Open-Elevation returned {len(results)} results for {len(locations)} points")
-    return [r["elevation"] for r in results]
+# AWS elevation-tiles-prod: https://s3.amazonaws.com/elevation-tiles-prod/skadi/
+# Tiles are SRTM1 (1 arcsec ≈ 30m) stored as individual gzip-compressed HGT files.
+_SRTM_AWS_URL = "https://s3.amazonaws.com/elevation-tiles-prod/skadi/{tdir}/{tile}.hgt.gz"
+
+
+def _srtm3_tile_name(lat: float, lon: float) -> tuple:
+    """Return (tile_name, lat_floor, lon_floor) for the 1° tile containing (lat, lon)."""
+    lat0 = int(math.floor(lat))
+    lon0 = int(math.floor(lon))
+    ns = "N" if lat0 >= 0 else "S"
+    ew = "E" if lon0 >= 0 else "W"
+    return f"{ns}{abs(lat0):02d}{ew}{abs(lon0):03d}", lat0, lon0
+
+
+def _load_srtm3_tile(tile_name: str):
+    """Load SRTM1 tile from local cache or download from AWS Open Data.
+
+    Returns (array.array of signed int16, n) where n=3601 (SRTM1) or 1201 (SRTM3).
+    Returns None if the tile could not be loaded (e.g. ocean tile with no land data).
+    """
+    if tile_name in _DEM_TILE_CACHE:
+        return _DEM_TILE_CACHE[tile_name]
+
+    try:
+        _os.makedirs(DEM_CACHE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    cache_path = _os.path.join(DEM_CACHE_DIR, f"{tile_name}.hgt")
+    raw: bytes | None = None
+
+    # --- Try local cache first -----------------------------------------------
+    if _os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as fh:
+                raw = fh.read()
+        except Exception:
+            raw = None
+
+    # --- Download from AWS if not cached -------------------------------------
+    if not raw:
+        # Determine the tile directory component (e.g. "N42" from "N42W002")
+        tdir = tile_name[:3]   # first 3 chars: N42, S05, etc.
+        url = _SRTM_AWS_URL.format(tdir=tdir, tile=tile_name)
+        try:
+            resp = requests.get(url, timeout=60)
+            if resp.status_code == 404:
+                # Tile doesn't exist (ocean or polar): cache sentinel, don't retry
+                _DEM_TILE_CACHE[tile_name] = None
+                return None
+            resp.raise_for_status()
+            raw = _gzip.decompress(resp.content)
+            # Persist to disk
+            try:
+                with open(cache_path, "wb") as fh:
+                    fh.write(raw)
+                print(f"    [dem] {tile_name}: saved {len(raw)//1024} KB → {cache_path}",
+                      file=sys.stderr)
+            except OSError as e:
+                print(f"    [dem] {tile_name}: download OK but could not save ({e})",
+                      file=sys.stderr)
+        except Exception as exc:
+            print(f"    [dem] {tile_name}: download failed ({exc})", file=sys.stderr)
+            _DEM_TILE_CACHE[tile_name] = None
+            return None
+
+    if not raw:
+        _DEM_TILE_CACHE[tile_name] = None
+        return None
+
+    # --- Parse HGT binary (big-endian int16) ---------------------------------
+    # SRTM1 = 3601×3601 = 25,934,402 bytes;  SRTM3 = 1201×1201 = 2,884,802 bytes
+    n = 3601 if len(raw) >= 25_000_000 else 1201
+    arr = _array_mod.array("h", raw)   # signed short, native endian after byteswap
+    arr.byteswap()                      # big-endian → native
+    result = (arr, n)
+    _DEM_TILE_CACHE[tile_name] = result
+    return result
+
+
+def _sample_srtm3(arr, n: int, lat: float, lon: float, lat0: int, lon0: int) -> float:
+    """Bilinear interpolation from an SRTM tile. Returns elevation in metres.
+
+    SRTM row 0 = northernmost (lat0+1), row n-1 = southernmost (lat0).
+    Col 0 = westernmost (lon0), col n-1 = easternmost (lon0+1).
+    No-data sentinel = -32768 → treated as 0 m.
+    """
+    row_f = (lat0 + 1.0 - lat) * (n - 1)
+    col_f = (lon - lon0) * (n - 1)
+    r = max(0, min(int(row_f), n - 2))
+    c = max(0, min(int(col_f), n - 2))
+    dr = row_f - r
+    dc = col_f - c
+
+    def _v(row: int, col: int) -> float:
+        val = arr[row * n + col]
+        return max(0.0, float(val)) if val != -32768 else 0.0
+
+    return (_v(r, c) * (1 - dr) * (1 - dc)
+            + _v(r, c + 1) * (1 - dr) * dc
+            + _v(r + 1, c) * dr * (1 - dc)
+            + _v(r + 1, c + 1) * dr * dc)
 
 
 def _get_elevations_opentopodata(locations: list[dict]) -> list[float]:
-    """Try Open-Topo-Data (SRTM 30m). Returns elevations in metres or raises on failure.
-    API expects locations as a pipe-separated string: 'lat,lon|lat,lon|...' (max 100 per request).
-    """
-    # Build pipe-separated string as required by the Open-Topo-Data API
+    """Open-Topo-Data SRTM30m API — used only as fallback when SRTM tile is unavailable."""
     loc_str = "|".join(f"{loc['latitude']},{loc['longitude']}" for loc in locations)
-    resp = requests.post(
-        OPEN_TOPO_DATA_URL,
-        json={"locations": loc_str},
-        timeout=20,
-    )
+    resp = requests.post(OPEN_TOPO_DATA_URL, json={"locations": loc_str}, timeout=20)
     resp.raise_for_status()
     data = resp.json()
     if data.get("status") != "OK":
         raise ValueError(f"Open-Topo-Data status: {data.get('status')}")
     results = data["results"]
     if len(results) != len(locations):
-        raise ValueError(f"Open-Topo-Data returned {len(results)} results for {len(locations)} points")
+        raise ValueError(f"Open-Topo-Data returned {len(results)} for {len(locations)} points")
     return [r["elevation"] or 0.0 for r in results]
 
 
 def get_elevations_m(points: list[tuple[float, float]]) -> list[float]:
-    """
-    Query terrain elevation for a list of (lat, lon) tuples.
-    Tries Open-Elevation first; falls back to Open-Topo-Data (SRTM 30m).
-    Returns 0 m for each point if both sources fail.
+    """Return terrain elevation in metres for each (lat, lon) in *points*.
+
+    Tries local SRTM3 HGT tiles first (auto-downloaded from USGS on first use,
+    then served entirely from ~DEM_CACHE_DIR without any API call).
+    Falls back to Open-Topo-Data API only for points whose tile could not be loaded.
     """
     if not points:
         return []
-    locations = [{"latitude": lat, "longitude": lon} for lat, lon in points]
-    try:
-        return _get_elevations_open_elevation(locations)
-    except Exception as exc:
-        print(f"    [warn] Open-Elevation failed ({exc}); retrying with Open-Topo-Data...",
-              file=sys.stderr)
-    try:
-        return _get_elevations_opentopodata(locations)
-    except Exception as exc2:
-        print(f"    [warn] Open-Topo-Data also failed ({exc2}); using 0 m fallback.",
-              file=sys.stderr)
-        return [0.0] * len(points)
+
+    results: list[float] = [0.0] * len(points)
+    api_fallback_indices: list[int] = []
+
+    for i, (lat, lon) in enumerate(points):
+        tile_name, lat0, lon0 = _srtm3_tile_name(lat, lon)
+        tile = _load_srtm3_tile(tile_name)
+        if tile is not None:
+            arr, n = tile
+            results[i] = _sample_srtm3(arr, n, lat, lon, lat0, lon0)
+        else:
+            api_fallback_indices.append(i)
+
+    if api_fallback_indices:
+        fallback_pts = [points[i] for i in api_fallback_indices]
+        locations = [{"latitude": lat, "longitude": lon} for lat, lon in fallback_pts]
+        try:
+            api_elev = _get_elevations_opentopodata(locations)
+            for j, idx in enumerate(api_fallback_indices):
+                results[idx] = api_elev[j]
+        except Exception as exc:
+            print(f"    [warn] SRTM tile missing and API fallback failed: {exc}",
+                  file=sys.stderr)
+
+    return results
 
 
 def max_terrain_elevation_ft(lat1: float, lon1: float,
@@ -468,6 +644,241 @@ def get_landmark(lat: float, lon: float, zoom: int = 10) -> str:
     except Exception as exc:
         print(f"    [warn] Nominatim query failed: {exc}", file=sys.stderr)
         return f"{lat:.3f}°N {lon:.3f}°E"
+
+
+def _query_overpass(lat: float, lon: float, radius_m: int = 8000) -> list[dict]:
+    """
+    Query Overpass API for POIs around (lat, lon) within radius_m meters.
+    Returns a list of candidate dicts with keys: name, lat, lon, tags.
+    """
+    # Try a list of known Overpass instances (rotate on failure).
+    OVERPASS_ENDPOINTS = [
+        "https://z.overpass-api.de/api/interpreter",
+        "https://lz4.overpass-api.de/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
+    ]
+
+    # Node-only query: peaks/viewpoints/places/historic/water are stored as OSM nodes;
+    # node queries are fast and avoid expensive way/rel area scans.
+    def _cln(tag: str) -> str:
+        return f'node(around:{{r}},{{lat}},{{lon}}){tag}["name"];'
+
+    tag_clauses = "".join([
+        _cln('["natural"="peak"]'),
+        _cln('["tourism"="viewpoint"]'),
+        _cln('["historic"]'),
+        # place nodes: exactly the coord CARTO uses for settlement label rendering
+        _cln('["place"~"^(city|town|village|hamlet)$"]'),
+        _cln('["natural"="water"]'),
+        _cln('["waterway"="river"]'),
+    ])
+
+    q = (
+        "[out:json][timeout:30];(" + tag_clauses.format(r=radius_m, lat=lat, lon=lon) + ");out;"
+    )
+
+    # Simple disk cache to reuse previous successful queries when endpoints are flaky.
+    cache_dir = _os.path.join(TILE_CACHE_DIR, "overpass_cache")
+    try:
+        _os.makedirs(cache_dir, exist_ok=True)
+    except Exception:
+        cache_dir = None
+
+    cache_key = f"ov_{lat:.5f}_{lon:.5f}_{radius_m}"
+    cache_file = _os.path.join(cache_dir, cache_key + ".json") if cache_dir else None
+
+    # Helper to parse resp json into results list
+    def _parse_overpass_json(data_json):
+        elems = data_json.get("elements", [])
+        results = []
+        for el in elems:
+            tags = el.get("tags") or {}
+            name = tags.get("name") or tags.get("ref")
+            if not name:
+                continue
+            if el.get("type") == "node":
+                lat_e = el.get("lat")
+                lon_e = el.get("lon")
+            else:
+                ctr = el.get("center") or el.get("bounds")
+                if isinstance(ctr, dict) and "lat" in ctr:
+                    lat_e = ctr.get("lat")
+                    lon_e = ctr.get("lon")
+                else:
+                    continue
+            try:
+                results.append({"name": name, "lat": float(lat_e), "lon": float(lon_e), "tags": tags})
+            except Exception:
+                continue
+        return results
+
+    # Check disk cache FIRST — avoid hitting the network when data is already on disk.
+    if cache_file and _os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf8") as fh:
+                data = json.load(fh)
+            results = _parse_overpass_json(data)
+            if results:
+                return results
+        except Exception:
+            pass  # corrupt cache — fall through to live query
+
+    # Try endpoints in order; one attempt each, fast-fail on HTTP errors.
+    for endpoint in OVERPASS_ENDPOINTS:
+        # Skip endpoints still in cooldown after recent failures
+        last_fail = OVERPASS_STATE.get(endpoint)
+        if last_fail is not None and (time.time() - last_fail) < OVERPASS_ENDPOINT_COOLDOWN_SEC:
+            continue
+
+        try:
+            resp = requests.post(endpoint, data=q, timeout=20)
+            if resp.status_code in (429, 503, 504):
+                # Rate-limited or server overloaded — cool this endpoint, try next immediately
+                OVERPASS_STATE[endpoint] = time.time()
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            results = _parse_overpass_json(data)
+            # On success, clear any recorded failure and cache the response
+            OVERPASS_STATE.pop(endpoint, None)
+            if cache_file and results:
+                try:
+                    with open(cache_file, "w", encoding="utf8") as fh:
+                        json.dump(data, fh)
+                except Exception:
+                    pass
+            return results
+        except Exception:
+            # Connection/timeout error — mark cooldown and try next endpoint
+            OVERPASS_STATE[endpoint] = time.time()
+            continue
+
+    # All endpoints failed (cache was already checked above).
+
+    # Nothing available; caller should fall back (e.g. to Nominatim via get_landmark)
+    print("    [warn] All Overpass endpoints failed and no cache available.", file=sys.stderr)
+    return []
+
+
+def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float = 8.0,
+                       track_deg: Optional[float] = None,
+                       ac_lat: Optional[float] = None,
+                       ac_lon: Optional[float] = None) -> tuple:
+    """
+    Find a prominent nearby landmark preferring visible peaks/lakes/POIs via Overpass.
+
+    Returns (label: str, poi_lat: float, poi_lon: float).
+    label is truncated to 40 chars.  On failure falls back to Nominatim reverse-geocode,
+    using the search-centre (lat, lon) as the coordinate.
+
+    If track_deg + ac_lat/ac_lon are supplied, candidates are filtered to those
+    strictly LEFT of the track (relative bearing 180°–360° from the aircraft).
+    Within that half-plane, ahead-left (270°–360°) candidates receive a +20 score
+    bonus over behind-left ones — so we prefer landmarks the pilot can see ahead.
+    When no candidate sits in the left half-plane, the full candidate list is used
+    (better to show something than nothing).
+    """
+    radius_m = int(radius_nm * 1852)
+    candidates = _query_overpass(lat, lon, radius_m=radius_m)
+    if not candidates:
+        return get_landmark(lat, lon, zoom=zoom), lat, lon
+
+    def _rel_bearing(c) -> float:
+        """Relative bearing of candidate c from aircraft (0=ahead, 90=right, 270=left)."""
+        brg = bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"])
+        return (brg - track_deg + 360) % 360
+
+    # Priority ordering for tag types
+    def score_candidate(c):
+        t = c.get("tags", {})
+        # assign higher score to peaks, lakes, viewpoints, historic
+        if t.get("natural") == "peak":
+            base = 100
+        elif t.get("water") == "lake" or t.get("natural") == "water":
+            base = 90
+        elif t.get("tourism") == "viewpoint":
+            base = 80
+        elif "historic" in t:
+            base = 70
+        elif t.get("man_made") == "water_tower":
+            base = 60
+        elif t.get("amenity") == "place_of_worship":
+            base = 50
+        else:
+            # place nodes: town > village > hamlet (exact CARTO label positions)
+            place = t.get("place", "")
+            if place == "city":
+                base = 45
+            elif place == "town":
+                base = 44
+            elif place == "village":
+                base = 43
+            elif place == "hamlet":
+                base = 42
+            else:
+                base = 10
+        # Position bonus when track is known: prefer ahead-left over behind-left
+        if track_deg is not None and ac_lat is not None and ac_lon is not None:
+            try:
+                rb = _rel_bearing(c)
+                if 270 <= rb < 360:      # ahead-left quadrant
+                    base += 20
+                elif 180 <= rb < 270:    # behind-left quadrant
+                    base += 5
+                # right-side candidates get no bonus (will be filtered out below)
+            except Exception:
+                pass
+        return base
+
+    # If track info is available, restrict to left-of-track candidates.
+    if track_deg is not None and ac_lat is not None and ac_lon is not None:
+        try:
+            left_candidates = [
+                c for c in candidates
+                if 180 <= _rel_bearing(c) < 360
+            ]
+        except Exception:
+            left_candidates = []
+        # Only use the filtered list if it actually contains candidates.
+        if left_candidates:
+            candidates = left_candidates
+        # else: nothing on the left at all — keep full list as a last resort
+
+    # Evaluate visibility: prefer candidates that are not clearly occluded by terrain
+    visible = []
+    search_lat = ac_lat if ac_lat is not None else lat
+    search_lon = ac_lon if ac_lon is not None else lon
+    for c in candidates:
+        try:
+            # get POI elevation (try tag 'ele' first)
+            tags = c.get("tags", {})
+            ele = tags.get("ele")
+            if ele is not None:
+                poi_elev_ft = float(ele)
+            else:
+                poi_elev_m = get_elevations_m([(c["lat"], c["lon"])])[0]
+                poi_elev_ft = poi_elev_m * FEET_PER_METER
+            # terrain max between aircraft position and POI
+            max_terr = max_terrain_elevation_ft(search_lat, search_lon,
+                                                c["lat"], c["lon"], samples=9)
+            # if POI elevation is at or above intervening terrain minus small buffer, consider visible
+            if poi_elev_ft >= max_terr - 50:
+                visible.append((score_candidate(c), c))
+        except Exception:
+            continue
+
+    if not visible:
+        # none confidently visible — fallback to best-named candidate by score
+        candidates.sort(key=lambda x: score_candidate(x), reverse=True)
+        best = candidates[0]
+    else:
+        visible.sort(key=lambda x: x[0], reverse=True)
+        best = visible[0][1]
+
+    label = best.get("name")
+    poi_lat = best.get("lat", lat)
+    poi_lon = best.get("lon", lon)
+    return (label[:40] if label else get_landmark(lat, lon, zoom=zoom), poi_lat, poi_lon)
 
 
 # ---------------------------------------------------------------------------
@@ -590,11 +1001,26 @@ def build_legs(origin: dict, destination: dict,
             max_terr = max_terrain_elevation_ft(prev_lat, prev_lon, lat, lon)
             min_alt  = max_terr + TERRAIN_BUFFER_FT
 
-            # Referencia a la izquierda del avion (~45 grados, ~8 NM)
+            # Visual reference point: 45° left of track at ~8 NM lateral offset.
+            # This is the geographic area the pilot sees by turning their head
+            # left and looking down at ~45° from the cockpit vertical — like a
+            # laser from the seat pointing down-left at 45° to the vertical.
+            # We use this as the SEARCH CENTRE for Overpass, then place the dot
+            # at the actual returned POI coordinates (not at the search centre).
             track_deg    = bearing_to_destination(prev_lat, prev_lon, lat, lon)
-            left_bearing = (track_deg - 45 + 360) % 360
-            lm_lat, lm_lon = offset_point(lat, lon, left_bearing, 8.0)
-            landmark = get_landmark(lm_lat, lm_lon, zoom=12)
+            left_bearing = (track_deg - 90 + 360) % 360   # pure left (90°)
+            lm_lat, lm_lon = offset_point(lat, lon, left_bearing, 5.0)
+            # find_best_landmark returns (label, poi_lat, poi_lon): the poi_lat/lon
+            # are the actual OSM node coordinates, NOT the search centre.
+            # Pass track_deg + aircraft position so it can filter to left-of-track only.
+            try:
+                landmark, _lm_lat_store, _lm_lon_store = find_best_landmark(
+                    lm_lat, lm_lon, zoom=12, radius_nm=6.0,
+                    track_deg=track_deg, ac_lat=lat, ac_lon=lon)
+            except Exception:
+                landmark = get_landmark(lm_lat, lm_lon, zoom=12)
+                _lm_lat_store = lm_lat
+                _lm_lon_store = lm_lon
 
             # Alternativa mas cercana (excluyendo origen y destino)
             alt = closest_airport(lat, lon,
@@ -642,6 +1068,8 @@ def build_legs(origin: dict, destination: dict,
                 "alt_bearing_mag":  round(alt_brg_mag),
                 "alt_time_min":     int(alt["time_min"]),
                 "alt_runways":      alt["runways"],
+                "lm_lat":           _lm_lat_store,
+                "lm_lon":           _lm_lon_store,
             })
 
             prev_lat, prev_lon = lat, lon
@@ -664,7 +1092,7 @@ def recommended_cruise_altitude(legs: list[dict]) -> int:
         return 1000
     max_terrain = max(leg["max_terrain_ft"] for leg in real_legs)
     max_leg_min = max(leg["min_alt_ft"] for leg in real_legs)
-    min_safe = max(max_terrain + 300, max_leg_min)
+    min_safe = max(max_terrain + TERRAIN_BUFFER_FT, max_leg_min)
     return int(math.ceil(min_safe / 500) * 500)
 
 
@@ -765,7 +1193,7 @@ def compute_wind_effect(tc_true: float, tas_kts: float,
     Parameters
     ----------
     tc_true        : True course of the route (degrees)
-    tas_kts        : True airspeed (knots) – we treat IAS ≈ TAS here
+    tas_kts        : True airspeed (knots)
     wind_from_deg  : Wind direction FROM (degrees true), e.g. 270 = westerly
     wind_speed_kts : Wind speed (knots)
     total_nm       : Total route distance (NM)
@@ -774,17 +1202,21 @@ def compute_wind_effect(tc_true: float, tas_kts: float,
     Returns a dict with all values needed for the display box.
     """
     # Angle between wind-from and true course
-    # Headwind component: positive = headwind, negative = tailwind
+    # Physical headwind component (positive = headwind). We store hw
+    # with the *opposite* sign so that: hw < 0 => headwind (slows),
+    # hw > 0 => tailwind (adds speed).
     angle_rad = math.radians(wind_from_deg - tc_true)
-    hw  = wind_speed_kts * math.cos(angle_rad)   # + headwind / - tailwind
-    xw  = wind_speed_kts * math.sin(angle_rad)   # + from right / - from left
+    hw_phys = wind_speed_kts * math.cos(angle_rad)   # + headwind / - tailwind (physical)
+    hw = -hw_phys
+    xw  = wind_speed_kts * math.sin(angle_rad)       # + from right / - from left
 
     # Wind Correction Angle (WCA) to maintain track
     wca_rad = math.asin(max(-1.0, min(1.0, xw / tas_kts)))
     wca_deg = math.degrees(wca_rad)              # negative = correct left
 
-    # Ground speed after correcting for crosswind
-    gs = tas_kts * math.cos(wca_rad) - hw
+    # Ground speed after correcting for crosswind. Note that `hw` is
+    # signed with tailwind positive, headwind negative, so add it.
+    gs = tas_kts * math.cos(wca_rad) + hw
     gs = max(1.0, gs)                            # safety floor
 
     # Adjusted ETE
@@ -797,10 +1229,10 @@ def compute_wind_effect(tc_true: float, tas_kts: float,
     # Determine qualitative descriptions
     if abs(hw) < 1.0:
         hw_label = "Sin componente frontal/trasero"
-    elif hw > 0:
-        hw_label = f"Viento en cara  {hw:.0f} kt  → más lento"
+    elif hw < 0:
+        hw_label = f"Viento en cara  {abs(hw):.0f} kt  → más lento"
     else:
-        hw_label = f"Viento de cola  {abs(hw):.0f} kt  → más rápido"
+        hw_label = f"Viento de cola  {hw:.0f} kt  → más rápido"
 
     if abs(xw) < 1.0:
         xw_label = "Sin componente cruzada"
@@ -833,6 +1265,20 @@ def compute_wind_effect(tc_true: float, tas_kts: float,
         "source":        "",          # filled by caller
         "pressure_hpa":  "",          # filled by caller
     }
+
+
+def ias_to_tas(ias_kts: float, pressure_alt_ft: float) -> float:
+    """
+    Simple IAS -> TAS approximation.
+
+    Uses a rule-of-thumb of +2% TAS per 1,000 ft pressure altitude.
+    This is a light-weight approximation (no temperature/density-alt correction).
+    Returns TAS in knots.
+    """
+    if ias_kts is None:
+        return 0.0
+    factor = 1.0 + 0.02 * (float(pressure_alt_ft) / 1000.0)
+    return float(ias_kts) * factor
 
 
 # ---------------------------------------------------------------------------
@@ -946,6 +1392,19 @@ def fetch_winds_for_legs(legs: list[dict], altitude_ft: float) -> None:
             if spd is not None and drn is not None:
                 leg["wind_speed_kt"]  = round(float(spd))
                 leg["wind_from_deg"]  = round(float(drn))
+                # Compute components relative to the leg track (true)
+                seg_track = leg.get("segment_track_true")
+                try:
+                    if seg_track is not None:
+                        ang = math.radians(leg["wind_from_deg"] - seg_track)
+                        phys_hw = leg["wind_speed_kt"] * math.cos(ang)   # physical: + head / - tail
+                        # Store with convention: negative=headwind (slows), positive=tailwind
+                        hw_stored = -phys_hw
+                        xw = leg["wind_speed_kt"] * math.sin(ang)       # + from right / - from left
+                        leg["wind_hw_kt"] = round(hw_stored, 1)
+                        leg["wind_xw_kt"] = round(xw, 1)
+                except Exception:
+                    pass
         except Exception:
             pass   # leave leg without wind keys on any error
 
@@ -962,6 +1421,7 @@ PANEL_H = PAGE_H
 
 MARGIN = 8 * mm
 INNER_W = PANEL_W - 2 * MARGIN
+FULL_INNER_W = PAGE_W - 2 * MARGIN   # full A4 landscape inner width ≈ 281 mm
 
 # Paleta de bajo consumo de tinta
 # Cabeceras: letra negra sobre fondo blanco, solo con linea inferior
@@ -999,7 +1459,7 @@ SMALL_STYLE = _style("small",
                      fontSize=6, fontName="Helvetica", leading=8)
 
 ALT_CELL_STYLE = _style("alt_cell",
-                        fontSize=5.5, fontName="Helvetica", leading=6)
+                        fontSize=6.5, fontName="Helvetica", leading=7.5)
 
 FREQ_TITLE_STYLE = _style("freq_title",
                           fontSize=9, fontName="Helvetica-Bold",
@@ -1027,20 +1487,125 @@ def _table_style_base(row_count: int) -> TableStyle:
     return TableStyle(cmds)
 
 
+# ---------------------------------------------------------------------------
+# Flight data container – passed to draw_* functions instead of long arg lists
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FlightData:
+    origin:              dict
+    destination:         dict
+    tc:                  float
+    mag_var:             float
+    mh:                  float
+    total_nm:            float
+    ete_min:             float
+    fuel_required_gal:   float
+    origin_freqs:        list
+    dest_freqs:          list
+    legs:                list
+    descent_leg:         Optional[dict]
+    cruise_alt_ft:       int            = 0
+    wind_effect:         Optional[dict] = None
+    cruise_speed_ias:    float          = 0.0
+    fuel_consumption_gph: float         = 0.0
+
+
+def _draw_wind_box(c: canvas.Canvas,
+                   we: dict,
+                   tc: float,
+                   mh: float,
+                   box_x: float,
+                   box_y: float) -> None:
+    """Draw the projected-wind summary box at the given position."""
+    wind_box_h = 18 * mm
+    wy = box_y + wind_box_h
+
+    c.setStrokeColor(COL_BORDER)
+    c.setLineWidth(0.4)
+    c.rect(box_x, box_y, INNER_W, wind_box_h)
+
+    # Header
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 6)
+    src_tag = we.get("source", "")
+    lvl_tag = we.get("pressure_hpa", "")
+    src_str = f" [{src_tag} {lvl_tag} hPa]" if lvl_tag else (f" [{src_tag}]" if src_tag else "")
+    c.drawString(box_x + 2 * mm, wy - 3 * mm,
+                 f"VIENTO EN RUTA{src_str}  \u2014  "
+                 f"{we['wind_speed']:.0f} kt desde {we['wind_from']:.0f}\u00b0V  "
+                 f"(RC verdadero: {tc:.0f}\u00b0V)")
+
+    # Disclaimer
+    c.setFont("Helvetica-Oblique", 5)
+    c.setFillColor(colors.HexColor("#555555"))
+    disclaimer = ("\u26a0 Tiempo real Open-Meteo \u2013 verificar antes del vuelo"
+                  if src_tag == "Open-Meteo"
+                  else "\u26a0 MANUAL \u2013 el viento real puede cambiar en cualquier momento")
+    c.drawRightString(box_x + INNER_W - 2 * mm, wy - 3 * mm, disclaimer)
+
+    # Separator
+    c.setStrokeColor(colors.HexColor("#AAAAAA"))
+    c.setLineWidth(0.3)
+    c.line(box_x, wy - 4.5 * mm, box_x + INNER_W, wy - 4.5 * mm)
+
+    # Three data columns
+    c.setFont("Helvetica", 5.5)
+    c.setFillColor(colors.black)
+    col3  = INNER_W / 3
+    cx1   = box_x + 2 * mm
+    cx2   = box_x + col3 + 2 * mm
+    cx3   = box_x + 2 * col3 + 2 * mm
+    lh    = 3.4 * mm
+    ly    = wy - 7 * mm
+
+    delta_sign = "+" if we["delta_min"] >= 0 else ""
+    c.drawString(cx1, ly, we["hw_label"])
+    c.drawString(cx1, ly - lh, f"Vel. sobre tierra (GS): {we['gs']:.0f} kt")
+    c.drawString(cx1, ly - 2 * lh,
+                 f"TEE ajustado: {int(round(we['new_ete_min']))} min "
+                 f"({delta_sign}{we['delta_min']:.0f} min)")
+
+    c.drawString(cx2, ly, we["xw_label"])
+    c.drawString(cx2, ly - lh, we["wca_label"])
+    c.drawString(cx2, ly - 2 * lh,
+                 f"Sin correcc.: deriva {we['drift_nm_per_5']:.1f} NM/5 min "
+                 f"a la {we['drift_dir']}")
+
+    wca_mag = we["wca_deg"]
+    new_mh  = (mh + wca_mag + 360) % 360
+    c.drawString(cx3, ly, f"RM sin viento: {mh % 360:.0f}\u00b0M")
+    c.drawString(cx3, ly - lh, f"RM corregido:  {new_mh:.0f}\u00b0M")
+    c.drawString(cx3, ly - 2 * lh,
+                 f"WCA: {abs(wca_mag):.1f}\u00b0 a la "
+                 + ("der." if wca_mag > 0 else "izq."))
+
+
 def draw_front_panel(c: canvas.Canvas,
-                     origin: dict, destination: dict,
-                     tc: float, mag_var: float, mh: float,
-                     total_nm: float, ete_min: float, fuel_gal: float,
-                     origin_freqs: list[dict], dest_freqs: list[dict],
-                     legs: list[dict],
-                     descent_leg: Optional[dict],
-                     cruise_alt_ft: int = 0,
-                     x_offset: float = 0.0,
-                     wind_effect: Optional[dict] = None) -> None:
+                     data: "FlightData",
+                     x_offset: float = 0.0) -> bool:
     """
     Dibuja la Hoja de Vuelo VFR en el panel A5 izquierdo (en español).
     Incluye columnas de registro manual (H.Real, C.Real) y fila de descenso.
+    Returns True if the wind summary box was deferred (doesn't fit on this page)
+    so the caller can draw it later (page 3).
     """
+    # Unpack for readability
+    origin       = data.origin
+    destination  = data.destination
+    tc           = data.tc
+    mag_var      = data.mag_var
+    mh           = data.mh
+    total_nm     = data.total_nm
+    ete_min      = data.ete_min
+    fuel_gal     = data.fuel_required_gal
+    origin_freqs = data.origin_freqs
+    dest_freqs   = data.dest_freqs
+    legs         = data.legs
+    descent_leg  = data.descent_leg
+    cruise_alt_ft = data.cruise_alt_ft
+    wind_effect  = data.wind_effect
+
     c.saveState()
     c.translate(x_offset, 0)
 
@@ -1122,67 +1687,54 @@ def draw_front_panel(c: canvas.Canvas,
         c.drawString(x_off, yy, "Viento:")
         yy -= 3.8 * mm
         c.setFont("Helvetica", 6)
-        c.drawString(x_off, yy, "QNH: _____")
-        c.drawString(x_off + 32 * mm, yy, "Squawk: _____")
+        c.drawString(x_off, yy, "QNH:")
+        c.drawString(x_off + 32 * mm, yy, "Squawk:")
 
-    y -= apt_info_h + 2 * mm
+    # Reduce gap between airport info and trip table to raise table slightly
+    y -= apt_info_h - 4 * mm
 
-    # ── Tabla de tramos ───────────────────────────────────────────────────────
-    # Columns: T.Plan | Track | Referencia | Alt.Mín | C.plan | Viento | Alternativo | H.Real | C.Real
-    col_widths = [9 * mm, 9 * mm, 28 * mm, 13 * mm, 10 * mm, 14 * mm, 26 * mm, 11 * mm, 6 * mm]
-    deficit = INNER_W - sum(col_widths)
-    if deficit > 0:
-        col_widths[2] += deficit  # extra espacio a Referencia
 
+    # Table headers and column widths for the trip log (9 columns)
     headers = [
-        "T.Plan\n(min)", "Track\n(\u00b0M)", "Referencia", "Alt.M\u00edn\n(ft)",
-        "C.plan\n(gal)", "Viento\n(kt/\u00b0V)", "Alternativo\n(ICAO/Frec)",
-        "T", "C",
+        "T.Plan", "Rumbo", "Referencia", "Alt.", "Comb.", "Viento",
+        "Alternativo", "H.Real", "C.Real",
+    ]
+    # Column widths: INNER_W ≈ 132.5 mm; fixed cols sum to 108 mm.
+    _cw_fixed = (9 + 11 + 35 + 10 + 9 + 16 + 9 + 9) * mm   # = 108 mm
+    col_widths = [
+         9 * mm,  # T.Plan
+        11 * mm,  # Rumbo
+        35 * mm,  # Referencia / landmark
+        10 * mm,  # Alt.
+         9 * mm,  # Comb.
+        16 * mm,  # Viento cell (two-line)
+        INNER_W - _cw_fixed,  # Alternativo – remaining (~24.5 mm)
+         9 * mm,  # H.Real
+         9 * mm,  # C.Real
     ]
 
-    COL_WRITEIN = colors.white    # sin relleno amarillo
-    COL_DESCENT = colors.white    # sin relleno naranja
-    COL_D_TEXT  = colors.black    # texto descenso en negro
-
-    # Combinar tramos + tramo de descenso ordenados por tiempo acumulado.
-    # Los waypoint-markers ya vienen embebidos en `legs`, también ordenados.
+    # Build the ordered list of table entries, inserting the descent marker at the
+    # right position (by cumulative time).
+    descent_cum = (
+        float(descent_leg.get("elapsed_min", 0))
+        if descent_leg
+        else float("inf")
+    )
     all_entries: list[dict] = []
+    descent_inserted = False
     for leg in legs:
+        cum = float(leg.get("_cumulative_min", leg.get("elapsed_min", 0)))
+        if descent_leg and not descent_inserted and cum >= descent_cum:
+            all_entries.append({"is_descent": True, "is_waypoint": False, "data": descent_leg})
+            descent_inserted = True
         all_entries.append({
-            "is_descent":  False,
-            "is_waypoint": leg.get("is_waypoint", False),
-            "data":        leg,
+            "is_descent": bool(leg.get("is_descent", False)),
+            "is_waypoint": bool(leg.get("is_waypoint")),
+            "data": leg,
         })
-    if descent_leg:
-        d_cum = descent_leg.get("_cumulative_min", descent_leg["elapsed_min"])
-        ins = len(all_entries)
-        for i, e in enumerate(all_entries):
-            if not e["is_waypoint"]:
-                e_cum = e["data"].get("_cumulative_min", e["data"]["elapsed_min"])
-                if e_cum >= d_cum:
-                    ins = i
-                    break
-        all_entries.insert(ins, {"is_descent": True, "is_waypoint": False, "data": descent_leg})
-
-    # Append final destination marker row (shows total ETE and distance)
-    try:
-        dest_marker = {
-            "is_waypoint": True,
-            "is_descent": False,
-            "data": {
-                "leg_num": 0,
-                "elapsed_min": int(round(ete_min)),
-                "_cumulative_min": ete_min,
-                "_cumulative_dist": total_nm,
-                "cum_dist_nm": round(total_nm, 1),
-                "lat": destination.get("lat"),
-                "lon": destination.get("lon"),
-                "landmark": f"\u25ba DEST: {destination.get('icao', '')}",
-            }
-        }
-        all_entries.append(dest_marker)
-    except Exception:
-        pass
+    # If descent wasn't inserted yet (e.g. it falls after all legs), append at end
+    if descent_leg and not descent_inserted:
+        all_entries.append({"is_descent": True, "is_waypoint": False, "data": descent_leg})
 
     rows = [headers]
     descent_row_idx:  Optional[int] = None
@@ -1247,17 +1799,32 @@ def draw_front_panel(c: canvas.Canvas,
         # Compact format: SS/CCC (speed/direction) to save space, e.g. 15/270
         if ws is not None and wd is not None and not is_d:
             try:
-                wind_cell = f"{int(round(ws))}/{int(round(wd)) :03d}"
+                # Top line: speed/direction (compact)
+                top = f"{int(round(ws))}/{int(round(wd)):03d}"
+                # Bottom line: headwind / crosswind (signed). Use stored components if available.
+                hw = leg.get("wind_hw_kt")
+                xw = leg.get("wind_xw_kt")
+                if hw is not None and xw is not None:
+                    bottom = f"{int(round(hw))}/{int(round(xw))}"
+                    wind_cell = top + "\n" + bottom
+                else:
+                    wind_cell = top
             except Exception:
                 wind_cell = f"{ws}/{wd}"
         else:
             wind_cell = ""
 
+        # Display altitudes rounded to the nearest 100 ft for readability
+        alt_val = leg.get("min_alt_ft")
+        if alt_val:
+            alt_disp = f"{int(round(float(alt_val) / 100.0) * 100):,}"
+        else:
+            alt_disp = ""
         rows.append([
             t_plan_str,
             track_str,
             lm,
-            f"{leg['min_alt_ft']:,}" if leg["min_alt_ft"] else "",
+            alt_disp,
             str(leg.get("fuel_burned_gal", "")),
             wind_cell,
             alt_cell,
@@ -1272,8 +1839,8 @@ def draw_front_panel(c: canvas.Canvas,
         ("BACKGROUND",    (0, 0), (-1, 0), colors.white),
         ("TEXTCOLOR",     (0, 0), (-1, -1), colors.black),
         ("FONTNAME",      (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, 0), 6),
-        ("FONTSIZE",      (0, 1), (-1, -1), 5.5),
+        ("FONTSIZE",      (0, 0), (-1, 0), 7),
+        ("FONTSIZE",      (0, 1), (-1, -1), 6.5),
         ("FONTNAME",      (0, 1), (-1, -1), "Helvetica"),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
         ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
@@ -1309,111 +1876,54 @@ def draw_front_panel(c: canvas.Canvas,
 
     available_h = y - MARGIN - 5 * mm
     w, h = tbl.wrapOn(c, INNER_W, available_h)
+    overflow: list = []
     if h > available_h:
-        frame = KeepInFrame(INNER_W, available_h, [tbl], mode="shrink")
-        w, h = frame.wrapOn(c, INNER_W, available_h)
-        frame.drawOn(c, MARGIN, y - h)
+        parts = tbl.split(INNER_W, available_h)
+        if parts:
+            _pw, ph = parts[0].wrapOn(c, INNER_W, available_h)
+            parts[0].drawOn(c, MARGIN, y - ph)
+        overflow = list(parts[1:]) if len(parts) > 1 else []
     else:
         tbl.drawOn(c, MARGIN, y - h)
 
     # ── Viento proyectado ───────────────────────────────────────────────────
+    # Draw inline only if the table fits on this page and wind fits below it.
+    wind_deferred = False
     if wind_effect:
-        we = wind_effect
-        wind_box_h = 18 * mm
-        wy = MARGIN + 6 * mm + wind_box_h   # top of the wind box
-
-        # Thin border box
-        c.setStrokeColor(COL_BORDER)
-        c.setLineWidth(0.4)
-        c.rect(MARGIN, MARGIN + 6 * mm, INNER_W, wind_box_h)
-
-        # Header
-        c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 6)
-        src_tag  = we.get("source", "")
-        lvl_tag  = we.get("pressure_hpa", "")
-        src_str  = f" [{src_tag} {lvl_tag} hPa]" if lvl_tag else (f" [{src_tag}]" if src_tag else "")
-        c.drawString(MARGIN + 2 * mm, wy - 3 * mm,
-                     f"VIENTO EN RUTA{src_str}  \u2014  "
-                     f"{we['wind_speed']:.0f} kt desde {we['wind_from']:.0f}\u00b0V  "
-                     f"(RC verdadero: {tc:.0f}\u00b0V)")
-
-        # Disclaimer
-        c.setFont("Helvetica-Oblique", 5)
-        c.setFillColor(colors.HexColor("#555555"))
-        disclaimer = ("\u26a0 Tiempo real Open-Meteo \u2013 verificar antes del vuelo"
-                      if src_tag == "Open-Meteo"
-                      else "\u26a0 MANUAL \u2013 el viento real puede cambiar en cualquier momento")
-        c.drawRightString(MARGIN + INNER_W - 2 * mm, wy - 3 * mm, disclaimer)
-
-        # Separator line under header
-        c.setStrokeColor(colors.HexColor("#AAAAAA"))
-        c.setLineWidth(0.3)
-        c.line(MARGIN, wy - 4.5 * mm, MARGIN + INNER_W, wy - 4.5 * mm)
-
-        # Three columns of data
-        c.setFont("Helvetica", 5.5)
-        c.setFillColor(colors.black)
-        col3 = INNER_W / 3
-        cx1 = MARGIN + 2 * mm
-        cx2 = MARGIN + col3 + 2 * mm
-        cx3 = MARGIN + 2 * col3 + 2 * mm
-        line_h = 3.4 * mm
-        ly = wy - 7 * mm
-
-        # Col 1: headwind / tailwind and ground speed
-        c.drawString(cx1, ly, we["hw_label"])
-        ly -= line_h
-        c.drawString(cx1, ly, f"Vel. sobre tierra (GS): {we['gs']:.0f} kt")
-        ly -= line_h
-        delta_sign = "+" if we["delta_min"] >= 0 else ""
-        c.drawString(cx1, ly,
-                     f"TEE ajustado: {int(round(we['new_ete_min']))} min "
-                     f"({delta_sign}{we['delta_min']:.0f} min)")
-
-        # Col 2: crosswind / correction
-        ly = wy - 7 * mm
-        c.drawString(cx2, ly, we["xw_label"])
-        ly -= line_h
-        c.drawString(cx2, ly, we["wca_label"])
-        ly -= line_h
-        c.drawString(cx2, ly,
-                     f"Sin correcc.: deriva {we['drift_nm_per_5']:.1f} NM/5 min "
-                     f"a la {we['drift_dir']}")
-
-        # Col 3: magnetic headings
-        ly = wy - 7 * mm
-        wca_mag = we["wca_deg"]
-        new_mh = (mh + wca_mag + 360) % 360
-        c.drawString(cx3, ly, f"RM sin viento: {mh % 360:.0f}\u00b0M")
-        ly -= line_h
-        c.drawString(cx3, ly, f"RM corregido:  {new_mh:.0f}\u00b0M")
-        ly -= line_h
-        c.drawString(cx3, ly,
-                     f"WCA: {abs(wca_mag):.1f}\u00b0 a la "
-                     + ("der." if wca_mag > 0 else "izq."))
-
+        wind_box_h     = 18 * mm
+        desired_bottom = MARGIN + 6 * mm
+        table_bottom   = y - h if not overflow else (y - available_h)
+        if not overflow and table_bottom >= (desired_bottom + wind_box_h + 2 * mm):
+            _draw_wind_box(c, wind_effect, tc, mh,
+                           box_x=MARGIN, box_y=desired_bottom)
+        else:
+            wind_deferred = True  # generate_pdf will draw it on page 3
 
     # ── Pie de p\u00e1gina ─────────────────────────────────────────────────────────
     c.setFont("Helvetica", 5)
     c.setFillColor(colors.grey)
-    c.drawCentredString(PANEL_W / 2, 3 * mm,
+    c.drawCentredString(PAGE_W / 2, 3 * mm,
                         "Datos: OurAirports \u00b7 Open-Elevation \u00b7 Nominatim/OSM  "
-                        "| Solo para planificaci\u00f3n/simulaci\u00f3n – verificar datos antes del vuelo")
+                        "| Solo para planificaci\u00f3n/simulaci\u00f3n \u2013 verificar datos antes del vuelo")
 
     c.restoreState()
+    return wind_deferred, overflow
 
 
 def draw_back_panel(c: canvas.Canvas,
-                    origin: dict, destination: dict,
-                    origin_freqs: list[dict], dest_freqs: list[dict],
-                    enroute_airports: list[dict],
+                    data: "FlightData",
+                    enroute_airports: list,
                     x_offset: float = 0.0,
                     rotate: bool = True) -> None:
     """
     Dibuja el Panel de Frecuencias, rotado 180 grados para impresion duplex
     con pliegue vertical.  Todo el texto en espanol.
     """
+    origin       = data.origin
+    destination  = data.destination
+    origin_freqs = data.origin_freqs
+    dest_freqs   = data.dest_freqs
+
     c.saveState()
     if rotate:
         # Rotar 180 grados respecto al centro del panel A5 (for duplex printing)
@@ -1426,23 +1936,27 @@ def draw_back_panel(c: canvas.Canvas,
         # No rotation: just translate to the right panel offset
         c.translate(x_offset, 0)
 
+    # Use A5 panel width for the frequency panel
+    panel_w = PANEL_W
+    inner_w = INNER_W
+
     # ── Cabecera: linea + texto negro, sin relleno ──────────────────────
     hdr_h = 18 * mm
     c.setStrokeColor(colors.black)
     c.setLineWidth(1)
-    c.line(0, PAGE_H - hdr_h, PANEL_W, PAGE_H - hdr_h)
+    c.line(0, PAGE_H - hdr_h, panel_w, PAGE_H - hdr_h)
     c.setFillColor(colors.black)
     c.setFont("Helvetica-Bold", 10)
-    c.drawCentredString(PANEL_W / 2, PAGE_H - 7 * mm,
+    c.drawCentredString(panel_w / 2, PAGE_H - 7 * mm,
                         f"PANEL DE FRECUENCIAS  \u00b7  {origin['icao']} \u2192 {destination['icao']}")
     c.setFont("Helvetica", 6)
     c.setFillColor(colors.black)
-    c.drawCentredString(PANEL_W / 2, PAGE_H - 13 * mm,
+    c.drawCentredString(panel_w / 2, PAGE_H - 13 * mm,
                         "Verificar todas las frecuencias en publicaciones vigentes antes del vuelo")
     # Linea separadora bajo cabecera
     c.setStrokeColor(COL_BORDER)
     c.setLineWidth(0.4)
-    c.line(MARGIN, PAGE_H - hdr_h, PANEL_W - MARGIN, PAGE_H - hdr_h)
+    c.line(MARGIN, PAGE_H - hdr_h, panel_w - MARGIN, PAGE_H - hdr_h)
 
     # ── Tablas de frecuencias ────────────────────────────────────────────────
     y = PAGE_H - hdr_h - 5 * mm
@@ -1489,11 +2003,11 @@ def draw_back_panel(c: canvas.Canvas,
         c.setFont("Helvetica", 6)
         c.drawString(MARGIN, y, "Viento:")
         y -= 4.5 * mm
-        c.drawString(MARGIN, y, "QNH: _____")
-        c.drawString(MARGIN + 32 * mm, y, "Squawk: _____")
+        c.drawString(MARGIN, y, "QNH:")
+        c.drawString(MARGIN + 32 * mm, y, "Squawk:")
         y -= 5 * mm
 
-        col_w = [18 * mm, INNER_W - 18 * mm - 24 * mm, 24 * mm]
+        col_w = [18 * mm, inner_w - 18 * mm - 24 * mm, 24 * mm]
         if freqs:
             rows = [["Tipo", "Descripci\u00f3n", "Frec. (MHz)"]]
             for f in freqs:
@@ -1509,7 +2023,7 @@ def draw_back_panel(c: canvas.Canvas,
 
         tbl = Table(rows, colWidths=col_w, rowHeights=rh)
         tbl.setStyle(_freq_table_style(len(rows), blank))
-        w, h = tbl.wrapOn(c, INNER_W, y - MARGIN)
+        w, h = tbl.wrapOn(c, inner_w, y - MARGIN)
         tbl.drawOn(c, MARGIN, y - h)
         y -= h + 5 * mm
 
@@ -1523,7 +2037,7 @@ def draw_back_panel(c: canvas.Canvas,
         c.drawString(MARGIN, y, "ALTERNATIVAS EN RUTA")
         y -= 5 * mm
 
-        col_w2 = [14 * mm, INNER_W - 14 * mm - 18 * mm - 34 * mm, 18 * mm, 34 * mm]
+        col_w2 = [14 * mm, inner_w - 14 * mm - 18 * mm - 34 * mm, 18 * mm, 34 * mm]
         if enroute_airports:
             rows2 = [["ICAO", "Aeropuerto / Pistas", "Dist/Rum/T", "Frecuencia"]]
             for apt in enroute_airports:
@@ -1559,13 +2073,13 @@ def draw_back_panel(c: canvas.Canvas,
 
         tbl2 = Table(rows2, colWidths=col_w2, rowHeights=rh2)
         tbl2.setStyle(_freq_table_style(len(rows2), blank2))
-        w, h = tbl2.wrapOn(c, INNER_W, y - MARGIN)
+        w, h = tbl2.wrapOn(c, inner_w, y - MARGIN)
         tbl2.drawOn(c, MARGIN, y - h)
 
     # ── Pie de p\u00e1gina ─────────────────────────────────────────────────────────
     c.setFont("Helvetica", 5)
     c.setFillColor(colors.grey)
-    c.drawCentredString(PANEL_W / 2, 3 * mm,
+    c.drawCentredString(panel_w / 2, 3 * mm,
                         "Datos: OurAirports  |  Solo para planificaci\u00f3n/simulaci\u00f3n")
 
     c.restoreState()
@@ -1585,26 +2099,538 @@ def draw_fold_guide(c: canvas.Canvas) -> None:
     c.restoreState()
 
 
+# ---------------------------------------------------------------------------
+# Leg minimap tiles
+# ---------------------------------------------------------------------------
+
+def _osm_tile_num(lat: float, lon: float, zoom: int) -> tuple:
+    """Return OSM tile (x, y) integer coordinates for the given lat/lon/zoom."""
+    n = 2 ** zoom
+    x = int((lon + 180.0) / 360.0 * n)
+    lat_r = math.radians(lat)
+    y = int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+    return x, y
+
+
+def _tile_nw_latlon(tx: int, ty: int, zoom: int) -> tuple:
+    """Return (lat, lon) of the north-west corner of tile (tx, ty) at zoom."""
+    n = 2 ** zoom
+    lon = tx / n * 360.0 - 180.0
+    lat_r = math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n)))
+    return math.degrees(lat_r), lon
+
+
+def _fetch_osm_tile(z: int, x: int, y: int, labels: bool = False):
+    """
+    Fetch (with disk cache) a single 256×256 CARTO tile, return PIL Image.
+    labels=False  → basemap geometry (roads, terrain, no text)
+    labels=True   → transparent labels-only overlay (text on transparent bg)
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    sub      = "labels" if labels else "base"
+    tile_dir = _os.path.join(TILE_CACHE_DIR, sub)
+    _os.makedirs(tile_dir, exist_ok=True)
+    cache_path = _os.path.join(tile_dir, f"{z}_{x}_{y}.png")
+    if _os.path.exists(cache_path):
+        try:
+            return Image.open(cache_path).convert("RGBA")
+        except Exception:
+            pass
+    url_tmpl = OSM_TILE_URL_LABELS if labels else OSM_TILE_URL
+    url      = url_tmpl.format(z=z, x=x, y=y)
+    try:
+        resp = requests.get(url, headers={"User-Agent": "VFROnePager/1.0 (educational)"}, timeout=10)
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+        img.save(cache_path)
+        return img
+    except Exception as exc:
+        print(f"    [warn] OSM tile {'lbl' if labels else 'base'} {z}/{x}/{y}: {exc}", file=sys.stderr)
+        # Transparent fallback for labels layer; grey fallback for base
+        return Image.new("RGBA", (256, 256), (0, 0, 0, 0) if labels else (220, 220, 220, 255))
+
+
+def _get_stitched_map(center_lat: float, center_lon: float,
+                      half_nm: float, zoom: int = OSM_TILE_ZOOM):
+    """
+    Fetch and stitch CARTO tiles covering ±half_nm from center.
+    Returns (base_img, labels_img, geo_info) where:
+      base_img   – geometry-only (roads, terrain) RGBA image
+      labels_img – transparent labels-only RGBA image (same size)
+      geo_info   – dict with lat_top, lon_left, lat_per_px, lon_per_px
+    Returns (None, None, None) if Pillow is unavailable.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None, None
+
+    half_lat = half_nm / 60.0
+    half_lon = half_lat / math.cos(math.radians(center_lat))
+
+    lat_top  = center_lat + half_lat
+    lat_bot  = center_lat - half_lat
+    lon_left = center_lon - half_lon
+    lon_right= center_lon + half_lon
+
+    tx_left,  ty_top = _osm_tile_num(lat_top, lon_left,  zoom)
+    tx_right, ty_bot = _osm_tile_num(lat_bot, lon_right, zoom)
+    tx_left,  tx_right = min(tx_left, tx_right), max(tx_left, tx_right)
+    ty_top,   ty_bot   = min(ty_top,  ty_bot),   max(ty_top,  ty_bot)
+
+    n_x = tx_right - tx_left + 1
+    n_y = ty_bot   - ty_top  + 1
+
+    TILE_PX  = 256
+    img_size = (n_x * TILE_PX, n_y * TILE_PX)
+    stitched        = Image.new("RGBA", img_size, (220, 220, 220, 255))
+    stitched_labels = Image.new("RGBA", img_size, (0, 0, 0, 0))
+    for ix in range(n_x):
+        for iy in range(n_y):
+            pos = (ix * TILE_PX, iy * TILE_PX)
+            t = _fetch_osm_tile(zoom, tx_left + ix, ty_top + iy, labels=False)
+            if t:
+                stitched.paste(t, pos)
+            tl = _fetch_osm_tile(zoom, tx_left + ix, ty_top + iy, labels=True)
+            if tl:
+                stitched_labels.paste(tl, pos)
+
+    nw_lat, nw_lon = _tile_nw_latlon(tx_left,     ty_top,   zoom)
+    se_lat, se_lon = _tile_nw_latlon(tx_right + 1, ty_bot + 1, zoom)
+
+    w, h = stitched.size
+    geo = {
+        "lat_top":   nw_lat,
+        "lon_left":  nw_lon,
+        "lat_per_px": (nw_lat - se_lat) / h,
+        "lon_per_px": (se_lon - nw_lon) / w,
+    }
+    return stitched, stitched_labels, geo
+
+
+def _latlon_to_px(lat: float, lon: float, geo: dict) -> tuple:
+    """Convert lat/lon to pixel coords in a stitched map given its geo_info."""
+    px = (lon - geo["lon_left"]) / geo["lon_per_px"]
+    py = (geo["lat_top"] - lat)  / geo["lat_per_px"]
+    return int(round(px)), int(round(py))
+
+
+def _rotate_point_cw(px: float, py: float, cx: float, cy: float,
+                     bearing_deg: float) -> tuple:
+    """
+    Rotate point (px, py) clockwise by bearing_deg degrees around center (cx, cy).
+    In image space (y increases down), CW rotation corresponds to PIL.rotate(-bearing).
+    """
+    ang = math.radians(bearing_deg)
+    dx, dy = px - cx, py - cy
+    rx =  dx * math.cos(ang) + dy * math.sin(ang)
+    ry = -dx * math.sin(ang) + dy * math.cos(ang)
+    return cx + rx, cy + ry
+
+
+def _build_tile_image(leg_lat: float, leg_lon: float,
+                      bearing_deg: float,
+                      lm_lat: float, lm_lon: float,
+                      lm_label: str,
+                      leg_num: int, cum_min: int,
+                      is_dest: bool = False):
+    """
+    Build a track-up minimap PIL Image for a single leg checkpoint.
+
+    Layout (track-up, A4 landscape print):
+      - Checkpoint (red circle) at (TILE_CHKPT_X_FRAC, TILE_CHKPT_Y_FRAC)
+        → track displaced to the right, leaving left area for the POI.
+      - Track line enters from bottom of tile along the same bearing.
+      - Landmark (blue flag) placed at its actual geographic position.
+      - Leg number + cumulative time shown in the tile header.
+    Returns a PIL Image, or None if Pillow is unavailable.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        print("  [warn] Pillow not installed – skipping leg tile minimap.", file=sys.stderr)
+        return None
+
+    # ── Step 1: fetch stitched map centred on the leg checkpoint ──────────
+    CANVAS_HALF_NM = TILE_DISPLAY_NM * 1.5   # large enough to survive any rotation
+    raw_img, raw_labels, geo = _get_stitched_map(leg_lat, leg_lon, CANVAS_HALF_NM)
+    if raw_img is None or geo is None:
+        return None
+
+    orig_w, orig_h = raw_img.size
+
+    # ── Step 2: compute the GEOGRAPHIC (Mercator-conformal) pixel scale ───
+    # OSM tiles in web-Mercator are conformal: nm/px is equal in x and y.
+    # 1° lon at latitude φ = 60·cos(φ) NM.  geo["lon_per_px"] is deg/px in x.
+    nm_per_px = geo["lon_per_px"] * 60.0 * math.cos(math.radians(leg_lat))
+    if nm_per_px <= 0:
+        return None
+
+    # Raw-image pixels that span exactly TILE_DISPLAY_NM (the crop square side).
+    crop_px = max(64, int(round(TILE_DISPLAY_NM / nm_per_px)))
+
+    # ── Step 3: pixel coords of checkpoint & landmark in the RAW image ────
+    # DO NOT resize to square here – that would distort the Mercator aspect ratio
+    # and make all bearings wrong after rotation.
+    img_cx = orig_w / 2.0
+    img_cy = orig_h / 2.0
+    cx_raw = (leg_lon - geo["lon_left"]) / geo["lon_per_px"]
+    cy_raw = (geo["lat_top"] - leg_lat)  / geo["lat_per_px"]
+    lx_raw = (lm_lon  - geo["lon_left"]) / geo["lon_per_px"]
+    ly_raw = (geo["lat_top"] - lm_lat)   / geo["lat_per_px"]
+
+    # ── Step 4: rotate image CCW by bearing_deg → track points UP ─────────
+    # PIL.rotate(+angle) = CCW.  For a northbound track (bearing=0) no rotation
+    # is needed; for eastbound (bearing=90) rotating CCW 90° puts east at the top.
+    rotated = raw_img.rotate(
+        bearing_deg,
+        resample=Image.BICUBIC,
+        expand=False,
+        center=(int(img_cx), int(img_cy)),
+        fillcolor=(235, 235, 230, 255),
+    )
+
+    # ── Step 5: rotate the point coords with the SAME CCW transform ───────
+    # _rotate_point_cw(px, py, cx, cy, angle) computes CCW-in-screen-space,
+    # which is exactly what PIL.rotate(angle) does to pixel positions.
+    cx_r, cy_r = _rotate_point_cw(cx_raw, cy_raw, img_cx, img_cy, bearing_deg)
+    lx_r, ly_r = _rotate_point_cw(lx_raw, ly_raw, img_cx, img_cy, bearing_deg)
+
+    # ── Step 6: crop a square of crop_px × crop_px, placing the checkpoint
+    #            at (TILE_CHKPT_X_FRAC, TILE_CHKPT_Y_FRAC) in the crop ────
+    crop_l = int(round(cx_r - crop_px * TILE_CHKPT_X_FRAC))
+    crop_t = int(round(cy_r - crop_px * TILE_CHKPT_Y_FRAC))
+
+    # Pad the rotated image so the crop window is always within valid pixels.
+    pad = crop_px
+    padded = Image.new("RGBA", (orig_w + 2 * pad, orig_h + 2 * pad), (235, 235, 230, 255))
+    padded.paste(rotated, (pad, pad))
+    tile = padded.crop((crop_l + pad, crop_t + pad,
+                        crop_l + pad + crop_px, crop_t + pad + crop_px))
+
+    # ── Step 7: resize the square crop to TILE_DISPLAY_PX ─────────────────
+    tile = tile.resize((TILE_DISPLAY_PX, TILE_DISPLAY_PX), Image.LANCZOS)
+    disp_scale = TILE_DISPLAY_PX / crop_px
+
+    # Overlay pixel positions after resize.
+    # IMPORTANT: use RAW (unrotated) coords for the landmark so it lines up
+    # with the CARTO labels overlay, which is also cropped without rotation.
+    chkpt_x = int(TILE_DISPLAY_PX * TILE_CHKPT_X_FRAC)
+    chkpt_y = int(TILE_DISPLAY_PX * TILE_CHKPT_Y_FRAC)
+    lx_tile = (lx_raw - cx_raw + crop_px * TILE_CHKPT_X_FRAC) * disp_scale
+    ly_tile = (ly_raw - cy_raw + crop_px * TILE_CHKPT_Y_FRAC) * disp_scale
+
+    # ── Step 8: composite horizontal labels onto the rotated base ──────────
+    # The labels layer (CARTO voyager_only_labels) is a transparent PNG with
+    # all text rendered in the source map's coordinate space (north-up).
+    # We crop it WITHOUT rotating – this keeps every word horizontal on the
+    # final tile regardless of track bearing.  The crop is aligned so that the
+    # checkpoint sits at the same (TILE_CHKPT_X_FRAC, TILE_CHKPT_Y_FRAC) as in
+    # the base, so town/road labels remain close to their true geographic
+    # positions.  For typical VFR bearings the positional accuracy is excellent
+    # near the checkpoint and degrades toward tile edges; this is acceptable for
+    # inflight area recognition.
+    if raw_labels is not None:
+        try:
+            lbl_crop_l = int(round(cx_raw - crop_px * TILE_CHKPT_X_FRAC))
+            lbl_crop_t = int(round(cy_raw - crop_px * TILE_CHKPT_Y_FRAC))
+            lbl_pad = crop_px  # same padding strategy as the base layer
+            lbl_padded = Image.new("RGBA",
+                                   (orig_w + 2 * lbl_pad, orig_h + 2 * lbl_pad),
+                                   (0, 0, 0, 0))
+            lbl_padded.paste(raw_labels, (lbl_pad, lbl_pad))
+            lbl_crop = lbl_padded.crop((
+                lbl_crop_l + lbl_pad,
+                lbl_crop_t + lbl_pad,
+                lbl_crop_l + lbl_pad + crop_px,
+                lbl_crop_t + lbl_pad + crop_px,
+            ))
+            lbl_tile = lbl_crop.resize((TILE_DISPLAY_PX, TILE_DISPLAY_PX),
+                                       Image.LANCZOS)
+            tile = Image.alpha_composite(tile.convert("RGBA"), lbl_tile)
+        except Exception:
+            pass  # labels composite failure is non-fatal
+
+    # ── Draw overlays ──────────────────────────────────────────────────────
+    draw = ImageDraw.Draw(tile)
+
+    # Track line:
+    #  - en-route: full height (shows track continuing beyond checkpoint)
+    #  - destination: only bottom → checkpoint (you're arriving, not continuing)
+    chkpt_x = int(TILE_DISPLAY_PX * TILE_CHKPT_X_FRAC)
+    chkpt_y = int(TILE_DISPLAY_PX * TILE_CHKPT_Y_FRAC)
+    if is_dest:
+        draw.line([(chkpt_x, TILE_DISPLAY_PX), (chkpt_x, chkpt_y)],
+                  fill=(0, 160, 0, 220), width=3)
+    else:
+        draw.line([(chkpt_x, TILE_DISPLAY_PX), (chkpt_x, 0)],
+                  fill=(220, 0, 0, 220), width=3)
+
+    # Checkpoint circle: green for destination, red for en-route
+    R = 10 if is_dest else 8
+    circ_fill    = (0, 160, 0, 240)    if is_dest else (220, 0, 0, 230)
+    circ_outline = (255, 255, 255, 255)
+    draw.ellipse([chkpt_x - R, chkpt_y - R, chkpt_x + R, chkpt_y + R],
+                 fill=circ_fill, outline=circ_outline, width=2)
+    if is_dest:
+        # Draw a small cross inside the circle to make it look like an airport
+        draw.line([(chkpt_x - R + 3, chkpt_y), (chkpt_x + R - 3, chkpt_y)],
+                  fill=(255, 255, 255, 255), width=2)
+        draw.line([(chkpt_x, chkpt_y - R + 3), (chkpt_x, chkpt_y + R - 3)],
+                  fill=(255, 255, 255, 255), width=2)
+
+    # Landmark dot (blue) + centered label below dot
+    lx_i, ly_i = int(round(lx_tile)), int(round(ly_tile))
+    if 10 < lx_i < TILE_DISPLAY_PX - 10 and 10 < ly_i < TILE_DISPLAY_PX - 10:
+        R2 = 7
+        draw.ellipse([lx_i - R2, ly_i - R2, lx_i + R2, ly_i + R2],
+                     fill=(0, 80, 200, 220), outline=(255, 255, 255, 255), width=2)
+
+        lm_short = (lm_label[:22] + "\u2026") if len(lm_label) > 23 else lm_label
+
+        # Load a Unicode-capable TrueType font so accented chars (ñ, é …) render
+        # correctly. Try common macOS/Linux paths, then fall back gracefully.
+        _font = None
+        _font_size = 13
+        for _fp in [
+            "/System/Library/Fonts/Helvetica.ttc",
+            "/System/Library/Fonts/SFNS.ttf",
+            "/System/Library/Fonts/SFNSDisplay.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+            "/Library/Fonts/Arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]:
+            try:
+                _font = ImageFont.truetype(_fp, _font_size)
+                break
+            except Exception:
+                continue
+        if _font is None:
+            try:
+                _font = ImageFont.load_default(size=_font_size)  # Pillow ≥ 9.2
+            except Exception:
+                _font = ImageFont.load_default()
+
+        # Measure text (getbbox preferred; fall back to getsize for older Pillow)
+        try:
+            _bb = _font.getbbox(lm_short)
+            tx_w, tx_h = _bb[2] - _bb[0], _bb[3] - _bb[1]
+        except Exception:
+            try:
+                tx_w, tx_h = _font.getsize(lm_short)
+            except Exception:
+                tx_w = max(20, int(len(lm_short) * 7)); tx_h = 14
+
+        pad2 = 4
+        txt_img = Image.new("RGBA", (tx_w + pad2 * 2, tx_h + pad2 * 2), (0, 0, 0, 0))
+        td = ImageDraw.Draw(txt_img)
+        # Thick white outline: draw text 8 times offset by 1 px
+        for ox, oy in [(-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(-1,1),(0,1),(1,1)]:
+            td.text((pad2 + ox, pad2 + oy), lm_short,
+                    fill=(255, 255, 255, 255), font=_font)
+        # Black text on top
+        td.text((pad2, pad2), lm_short, fill=(0, 0, 0, 255), font=_font)
+
+        rx_w, rx_h = txt_img.size
+        # Center label horizontally on dot, place just below it
+        paste_x = int(lx_i - rx_w / 2)
+        paste_y = int(ly_i + R2 + 3)
+        paste_x = max(2, min(paste_x, TILE_DISPLAY_PX - rx_w - 2))
+        paste_y = max(2, min(paste_y, TILE_DISPLAY_PX - rx_h - 2))
+        tile.paste(txt_img, (paste_x, paste_y), txt_img)
+
+    # Header bar (semi-transparent dark strip at top of tile)
+    header_h = 22
+    hdr_bg = (0, 100, 0, 190) if is_dest else (30, 30, 30, 180)
+    header_overlay = Image.new("RGBA", (TILE_DISPLAY_PX, header_h), hdr_bg)
+    tile.paste(header_overlay, (0, 0), header_overlay)
+    draw2 = ImageDraw.Draw(tile)
+    header_text = "DEST" if is_dest else f"T+{cum_min}min"
+    draw2.text((6, 5), header_text, fill=(255, 255, 255, 240))
+    # Leg number at top-right (suppress for dest tile)
+    if not is_dest:
+        leg_label = f"#{leg_num}"
+        draw2.text((TILE_DISPLAY_PX - 32, 5), leg_label, fill=(255, 220, 0, 240))
+
+    # North arrow (top-right corner, small)
+    na_x, na_y = TILE_DISPLAY_PX - 22, header_h + 14
+    arrow_len = 12
+    # Bearing = angle clockwise from north; in track-up image north is rotated
+    north_bearing_in_tile = (-bearing_deg + 360) % 360  # direction to north in tile coords
+    ang_r = math.radians(north_bearing_in_tile)
+    tip_x = na_x + arrow_len * math.sin(ang_r)
+    tip_y = na_y - arrow_len * math.cos(ang_r)
+    draw2.line([(na_x, na_y), (int(tip_x), int(tip_y))],
+               fill=(200, 0, 0, 220), width=2)
+    # 'N' label: always horizontal (consistent with all other labels on the tile).
+    draw2.text((int(tip_x) - 3, int(tip_y) - 10), "N", fill=(200, 0, 0, 220))
+
+    return tile.convert("RGB")
+
+
+def draw_leg_tiles_page(c: canvas.Canvas, legs: list, data: "FlightData",
+                        page_w: float, page_h: float) -> None:
+    """
+    Draw A4-landscape page(s) of leg minimap tiles, 4 columns × 3 rows per page.
+    Each tile is ~70mm × 67mm representing 10 NM at 1:250,000 scale, track-up.
+    """
+    try:
+        from PIL import Image
+        import io as _io2
+        from reportlab.lib.utils import ImageReader
+    except ImportError:
+        print("  [warn] Pillow not installed – skipping leg tile pages.", file=sys.stderr)
+        return
+
+    cols, rows_per_page = 4, 3
+    MARGIN_X = 5 * mm
+    MARGIN_Y = 8 * mm
+    GAP_X    = 2 * mm
+    GAP_Y    = 3 * mm
+    tile_w   = (page_w - 2 * MARGIN_X - (cols - 1) * GAP_X) / cols
+    tile_h   = (page_h - 2 * MARGIN_Y - (rows_per_page - 1) * GAP_Y) / rows_per_page
+
+    # Filter to real navigation legs (no waypoint markers, no descent rows)
+    real_legs = [l for l in legs
+                 if not l.get("is_waypoint") and not l.get("is_descent")]
+
+    # Ensure the last tile is the actual destination.
+    #
+    # The last computed leg is at int(seg_min/LEG_MINUTES) × LEG_MINUTES minutes
+    # which is typically ~6-15 % short of the destination.  Two strategies:
+    #
+    #  A) REPLACE the last leg with the destination when it is already within
+    #     the tile's look-ahead window (≤ TILE_DISPLAY_NM×(1−TILE_CHKPT_Y_FRAC)).
+    #     This avoids a near-duplicate tile showing virtually the same area twice.
+    #
+    #  B) APPEND a fresh destination tile when the last leg is farther away
+    #     (destination would be off the top of the tile or barely visible).
+    if real_legs:
+        last_leg  = real_legs[-1]
+        dest      = data.destination
+        dest_lat  = dest["lat"]
+        dest_lon  = dest["lon"]
+        last_lat  = last_leg.get("lat", dest_lat)
+        last_lon  = last_leg.get("lon", dest_lon)
+
+        # How many NM ahead of the checkpoint are visible in the tile
+        look_ahead_nm = TILE_DISPLAY_NM * (1.0 - TILE_CHKPT_Y_FRAC)
+        dist_to_dest  = gc_distance_nm(last_lat, last_lon, dest_lat, dest_lon)
+
+        dest_tile = {
+            "lat":                dest_lat,
+            "lon":                dest_lon,
+            "segment_track_true": last_leg.get("segment_track_true", 0),
+            "lm_lat":             dest_lat,
+            "lm_lon":             dest_lon,
+            "landmark":           dest.get("name") or dest.get("icao", ""),
+            "leg_num":            last_leg.get("leg_num", 0),
+            "_cumulative_min":    last_leg.get("_cumulative_min", 0),
+            "elapsed_min":        last_leg.get("elapsed_min", 0),
+            "is_dest":            True,
+        }
+
+        if dist_to_dest < 0.05:
+            # Already at destination (e.g. last leg == dest exactly)
+            pass
+        elif dist_to_dest <= look_ahead_nm:
+            # Strategy A: destination is within look-ahead → replace last leg
+            real_legs = real_legs[:-1] + [dest_tile]
+        else:
+            # Strategy B: destination is beyond look-ahead → append extra tile
+            dest_tile["leg_num"] = len(real_legs) + 1
+            real_legs = real_legs + [dest_tile]
+
+    tiles_per_page = cols * rows_per_page
+    total_tiles = len(real_legs)
+
+    for tile_idx, leg in enumerate(real_legs):
+        page_idx = tile_idx // tiles_per_page
+        pos_in_page = tile_idx % tiles_per_page
+
+        if pos_in_page == 0:
+            if tile_idx > 0:
+                c.showPage()
+            c.saveState()
+            c.setFont("Helvetica-Bold", 7)
+            c.setFillColor(colors.grey)
+            route_str = (f"{data.origin['icao']} \u2192 {data.destination['icao']}  "
+                         f"– Fichas de tramo")
+            c.drawString(MARGIN_X, page_h - 5 * mm, route_str)
+            page_num = page_idx + 1
+            c.drawRightString(page_w - MARGIN_X, page_h - 5 * mm,
+                              f"p\u00e1g. {page_num}")
+            c.restoreState()
+
+        col = pos_in_page % cols
+        row = pos_in_page // cols
+
+        # ReportLab origin is bottom-left; y = 0 at bottom
+        tile_x = MARGIN_X + col * (tile_w + GAP_X)
+        tile_y = page_h - MARGIN_Y - 7 * mm - (row + 1) * tile_h - row * GAP_Y
+
+        leg_lat  = leg.get("lat")
+        leg_lon  = leg.get("lon")
+        bearing  = leg.get("segment_track_true", 0)
+        lm_lat   = leg.get("lm_lat", leg_lat)
+        lm_lon   = leg.get("lm_lon", leg_lon)
+        lm_label = leg.get("landmark", "")
+        leg_num  = leg.get("leg_num", tile_idx + 1)
+        cum_min  = int(round(leg.get("_cumulative_min", leg.get("elapsed_min", 0))))
+
+        if leg_lat is None or leg_lon is None:
+            continue
+
+        is_dest  = leg.get("is_dest", False)
+        print(f"  [tile {tile_idx+1}/{total_tiles}] ({leg_lat:.3f},{leg_lon:.3f}) "
+              f"brg={bearing:.0f}° → {'DEST' if is_dest else f'T+{cum_min}min'}…",
+              end="", flush=True)
+        img = _build_tile_image(leg_lat, leg_lon, bearing, lm_lat, lm_lon,
+                                 lm_label, leg_num, cum_min, is_dest=is_dest)
+        if img is None:
+            print(" sin imagen", flush=True)
+            c.setStrokeColor(colors.lightgrey)
+            c.rect(tile_x, tile_y, tile_w, tile_h)
+            c.setFont("Helvetica", 6)
+            c.setFillColor(colors.grey)
+            c.drawCentredString(tile_x + tile_w / 2, tile_y + tile_h / 2, "sin imagen")
+            continue
+
+        bio = _io2.BytesIO()
+        img.save(bio, format="PNG")
+        bio.seek(0)
+        c.drawImage(ImageReader(bio), tile_x, tile_y, width=tile_w, height=tile_h,
+                    preserveAspectRatio=False)
+
+        # Thin border around tile
+        c.saveState()
+        c.setStrokeColor(colors.HexColor("#888888"))
+        c.setLineWidth(0.4)
+        c.rect(tile_x, tile_y, tile_w, tile_h, stroke=1, fill=0)
+        c.restoreState()
+
+        print(" OK", flush=True)
+
+
+
+
 def generate_pdf(output_path: str,
-                 origin: dict, destination: dict,
-                 cruise_speed_ias: float,
-                 fuel_consumption_gph: float,
-                 legs: list[dict],
-                 descent_leg: Optional[dict],
-                 origin_freqs: list[dict],
-                 dest_freqs: list[dict],
-                 tc: float, mag_var: float, mh: float,
-                 total_nm: float, ete_min: float,
-                 fuel_required_gal: float,
-                 cruise_alt_ft: int = 0,
-                 one_face: bool = False,
-                 wind_effect: Optional[dict] = None) -> None:
+                 data: "FlightData",
+                 one_face: bool = False) -> None:
     """
     Genera un PDF duplex de dos paginas en A4 apaisado:
       Pagina 1 – Frontal: Hoja de Vuelo VFR en el panel A5 izquierdo
       Pagina 2 – Dorso  : Panel de Frecuencias (rotado 180 grados) en el panel A5 derecho
                           (queda a la izquierda al girar la hoja y doblarla)
     """
+    origin      = data.origin
+    destination = data.destination
+    legs        = data.legs
+
     # Deduplicar alternativas en ruta por ICAO (omitir filas de waypoint)
     seen: set[str] = set()
     enroute: list[dict] = []
@@ -1623,50 +2649,47 @@ def generate_pdf(output_path: str,
 
     if one_face:
         # Draw both panels side-by-side on a single A4 landscape page
-        draw_front_panel(
-            c, origin, destination,
-            tc, mag_var, mh,
-            total_nm, ete_min, fuel_required_gal,
-            origin_freqs, dest_freqs, legs, descent_leg,
-            cruise_alt_ft=cruise_alt_ft,
-            x_offset=0,
-            wind_effect=wind_effect,
-        )
-        # Back panel unrotated on the right half
-        draw_back_panel(
-            c, origin, destination,
-            origin_freqs, dest_freqs, enroute,
-            x_offset=PANEL_W,
-            rotate=False,
-        )
+        wind_deferred, overflow = draw_front_panel(c, data, x_offset=0)
+        draw_back_panel(c, data, enroute, x_offset=PANEL_W, rotate=False)
         draw_fold_guide(c)
         c.showPage()
+        if overflow or (wind_deferred and data.wind_effect):
+            c.saveState()
+            y3 = PAGE_H - MARGIN
+            for part in overflow:
+                _pw, ph = part.wrapOn(c, INNER_W, y3 - MARGIN)
+                part.drawOn(c, MARGIN, y3 - ph)
+                y3 -= ph + 2 * mm
+            if wind_deferred and data.wind_effect:
+                _draw_wind_box(c, data.wind_effect, data.tc, data.mh,
+                               box_x=MARGIN, box_y=max(MARGIN, y3 - 18 * mm))
+            c.restoreState()
+            c.showPage()
     else:
-        # ── PAGINA 1 (FRONTAL) ───────────────────────────────────────────────────
-        draw_front_panel(
-            c, origin, destination,
-            tc, mag_var, mh,
-            total_nm, ete_min, fuel_required_gal,
-            origin_freqs, dest_freqs, legs, descent_leg,
-            cruise_alt_ft=cruise_alt_ft,
-            x_offset=0,
-            wind_effect=wind_effect,
-        )
+        wind_deferred, overflow = draw_front_panel(c, data, x_offset=0)
         draw_fold_guide(c)
         c.showPage()
 
-        # ── PAGINA 2 (DORSO) ─────────────────────────────────────────────────────
-        # Impresion duplex con giro por el borde largo (izquierdo):
-        #   El dorso del panel IZQUIERDO de la pag.1 se imprime en el DERECHO de la pag.2.
-        #   Rotamos 180 grados para que se lea correctamente al doblar verticalmente.
-        draw_back_panel(
-            c, origin, destination,
-            origin_freqs, dest_freqs, enroute,
-            x_offset=PANEL_W,   # mitad derecha de la hoja A4 apaisada
-            rotate=False,
-        )
+        draw_back_panel(c, data, enroute, x_offset=PANEL_W, rotate=False)
         draw_fold_guide(c)
         c.showPage()
+
+        if overflow or (wind_deferred and data.wind_effect):
+            c.saveState()
+            y3 = PAGE_H - MARGIN
+            for part in overflow:
+                _pw, ph = part.wrapOn(c, INNER_W, y3 - MARGIN)
+                part.drawOn(c, MARGIN, y3 - ph)
+                y3 -= ph + 2 * mm
+            if wind_deferred and data.wind_effect:
+                _draw_wind_box(c, data.wind_effect, data.tc, data.mh,
+                               box_x=MARGIN, box_y=max(MARGIN, y3 - 18 * mm))
+            c.restoreState()
+            c.showPage()
+
+    # Leg minimap tiles page(s)
+    print("[+] Generando fichas de tramo (tiles OSM)…")
+    draw_leg_tiles_page(c, data.legs, data, PAGE_W, PAGE_H)
 
     c.save()
     print(f"\n  PDF guardado en: {output_path}")
@@ -1736,6 +2759,27 @@ def main() -> None:
             "Marked as estimated – real wind can change at any time."
         ),
     )
+    parser.add_argument(
+        "--leg-minutes", type=float, default=None,
+        help=("Leg interval in minutes for route segmentation. If omitted, uses the default "
+              "value defined in the script (5). Use non-integer values for finer control."),
+    )
+    parser.add_argument(
+        "--terrain-buffer", type=float, default=300.0, metavar="FT",
+        help=("Terrain clearance buffer in feet used to compute safe altitudes. "
+              "Default: %(default)s ft (use 300 for recommended minimum)."),
+    )
+    parser.add_argument(
+        "--climb-rate", type=float, default=500.0,
+        help=("Climb rate in ft/min used to compute first-leg climb time to cruise altitude. "
+              "Default: %(default)s ft/min."),
+    )
+    parser.add_argument(
+        "--departure-runway", type=float, default=None, metavar="HDG",
+        help=("Departure runway heading in degrees magnetic (e.g. 330). "
+              "When given, adds a 2-minute straight-out climb row at the top of the trip "
+              "table (runway heading, until 1000 ft AGL) before turning to cruise track."),
+    )
     args = parser.parse_args()
 
     origin_icao  = args.origin_icao.upper().strip()
@@ -1743,6 +2787,18 @@ def main() -> None:
     cruise_kts   = args.cruise_speed_ias
     fuel_gph     = args.fuel_consumption_gph
     output_path  = args.output or f"{origin_icao}_{dest_icao}_vfr.pdf"
+
+    # Allow runtime override of the default leg interval defined at module scope
+    if args.leg_minutes is not None:
+        global LEG_MINUTES
+        LEG_MINUTES = float(args.leg_minutes)
+        print(f"  Leg interval: {LEG_MINUTES} min")
+
+    # Allow runtime override of the terrain buffer (default 300 ft)
+    if hasattr(args, 'terrain_buffer'):
+        global TERRAIN_BUFFER_FT
+        TERRAIN_BUFFER_FT = float(args.terrain_buffer)
+        print(f"  Terrain buffer: {TERRAIN_BUFFER_FT:.0f} ft")
 
     # Parse optional manual wind override (--wind SPEED/DIR)
     wind_override_speed: Optional[float] = None
@@ -1820,15 +2876,178 @@ def main() -> None:
     print(f"  Altitud de crucero recomendada: {cruise_alt} ft  "
           f"(terreno max: {max_terr:.0f} ft)")
 
+    # Adjust first leg duration to represent time to reach cruise altitude.
+    # If --departure-runway is given, prepend 2 min for straight-out climb to
+    # 1000 ft AGL, then the remaining climb time is added to the first nav leg.
+    DEPARTURE_STRAIGHT_MIN = 2.0
+    dep_rwy_hdg = getattr(args, "departure_runway", None)
+
+    try:
+        climb_rate_fpm = float(args.climb_rate)
+    except Exception:
+        climb_rate_fpm = 500.0
+    origin_elev = origin.get("elevation_ft", 0)
+    if cruise_alt and climb_rate_fpm and real_legs:
+        alt_to_gain = max(0.0, cruise_alt - origin_elev)
+        climb_time_min = alt_to_gain / float(climb_rate_fpm) if climb_rate_fpm > 0 else 0.0
+
+        # Use the first-leg duration heuristic (LEG_MINUTES * CLIMB_SPEED_FACTOR)
+        first_leg_min = round(LEG_MINUTES * CLIMB_SPEED_FACTOR, 1)
+        # Ensure the first-leg elapsed reflects climb needs (but otherwise keep regular segmentation)
+        total_overhead_min = max(climb_time_min, first_leg_min)
+
+        if total_overhead_min > 0:
+            # find first real leg index
+            first_idx = next((i for i, l in enumerate(legs) if not l.get("is_waypoint")), None)
+            if first_idx is not None:
+                first_leg = legs[first_idx]
+                old_elapsed = float(first_leg.get("elapsed_min", 0.0))
+                delta = total_overhead_min - old_elapsed
+                # update first leg elapsed and fuel burned (first-leg models climb)
+                first_leg["elapsed_min"] = total_overhead_min
+                first_leg["fuel_burned_gal"] = round(fuel_gph * (total_overhead_min / 60.0), 1)
+                # update cumulative mins for all subsequent legs/rows
+                for j in range(first_idx, len(legs)):
+                    if "_cumulative_min" in legs[j]:
+                        legs[j]["_cumulative_min"] = legs[j].get("_cumulative_min", 0.0) + delta
+                # recompute ete_min and fuel_req
+                real_legs_after = [l for l in legs if not l.get("is_waypoint")]
+                ete_min = max(float(l.get("_cumulative_min", 0.0)) for l in real_legs_after)
+                fuel_req = fuel_gph * (ete_min / 60.0)
+                print(f"  Ajustado primer tramo (subida): {total_overhead_min:.1f} min  "
+                      f"(delta {delta:+.1f} min). Nuevo TEE: {ete_min:.1f} min")
+
     # 4c. Tramo de descenso ---------------------------------------------------
+    # Algorithm:
+    #   1. Compute when to START descending (500 ft/min, dest elev + 1000 ft AGL, 2-min buffer).
+    #   2. Walk through legs in the descent zone in time order.
+    #   3. Floor at each leg = FORWARD terrain (next segment) + 300 ft, because the
+    #      leg's own max_terrain_ft is the highest point already crossed at cruise altitude.
+    #      What matters for descent is what's STILL AHEAD.
+    #   4. If forward floor > descent profile → level-off + warn.
+    #   5. When terrain clears → insert "▼ Retoma descenso" row.
     route_stops_full = [origin] + waypoints + [destination]
-    descent_leg = compute_descent_leg(
-        legs, route_stops_full, cruise_kts, fuel_gph, ete_min,
-        cruise_altitude_ft=cruise_alt,
+    dest_target_ft   = float(destination.get("elevation_ft", 0)) + 1000.0
+    alt_to_lose      = max(0.0, float(cruise_alt) - dest_target_ft)
+    desc_dur_min     = alt_to_lose / 500.0               # minutes at 500 ft/min
+    desc_start_min   = ete_min - desc_dur_min - 2.0      # 2-min circuit entry buffer
+    if desc_start_min <= 0:
+        desc_start_min = ete_min * 0.5
+
+    # Locate lat/lon for the ▼ INICIO DESCENSO marker via route interpolation
+    _speed_npm = cruise_kts * KNOTS_TO_NM_PER_MIN
+    _stop_et   = [0.0]
+    for k in range(1, len(route_stops_full)):
+        _seg_nm = gc_distance_nm(
+            route_stops_full[k-1]["lat"], route_stops_full[k-1]["lon"],
+            route_stops_full[k]["lat"],   route_stops_full[k]["lon"])
+        _stop_et.append(_stop_et[-1] + _seg_nm / _speed_npm)
+    _lat_d, _lon_d = route_stops_full[-1]["lat"], route_stops_full[-1]["lon"]
+    for k in range(1, len(route_stops_full)):
+        if _stop_et[k] >= desc_start_min:
+            _sf, _st = route_stops_full[k-1], route_stops_full[k]
+            _sd = _stop_et[k] - _stop_et[k-1]
+            _fr = min((desc_start_min - _stop_et[k-1]) / _sd, 0.99) if _sd > 0 else 0.99
+            _lat_d, _lon_d = intermediate_point(
+                _sf["lat"], _sf["lon"], _st["lat"], _st["lon"], _fr)
+            break
+
+    descent_leg = {
+        "is_waypoint":      False,
+        "is_departure":     False,
+        "is_descent":       True,
+        "leg_num":          0,
+        "elapsed_min":      round(desc_start_min),
+        "_cumulative_min":  desc_start_min,
+        "lat":              _lat_d,
+        "lon":              _lon_d,
+        "landmark":         "\u25bc INICIO DESCENSO",
+        "max_terrain_ft":   0,
+        "min_alt_ft":       int(cruise_alt),
+        "fuel_burned_gal":  round(fuel_gph * (desc_start_min / 60.0), 1),
+        "alt_icao":         destination["icao"],
+        "alt_name":         destination["name"],
+        "alt_dist_nm":      0,
+        "alt_freq":         "",
+        "segment_track_mag": None,
+    }
+    print(f"  Inicio descenso: min {round(desc_start_min)}  "
+          f"(desde {cruise_alt} ft → {int(dest_target_ft)} ft, {desc_dur_min:.1f} min)")
+
+    # Walk through legs in the descent zone
+    _desc_legs = sorted(
+        [l for l in legs
+         if not l.get("is_waypoint")
+         and float(l.get("_cumulative_min", l.get("elapsed_min", 0))) > desc_start_min],
+        key=lambda l: float(l.get("_cumulative_min", l.get("elapsed_min", 0))),
     )
-    if descent_leg:
-        print(f"  Inicio descenso: min {descent_leg['elapsed_min']} "
-              f"(alt crucero {descent_leg['min_alt_ft']} ft)")
+
+    # Precompute forward terrain (terrain from each leg position to the next) + terrain buffer floor.
+    # Each leg's own max_terrain_ft was computed for the segment BEHIND it (already crossed
+    # at cruise altitude), so it is irrelevant for descent.  What blocks descent is the
+    # terrain AHEAD — the next leg's backward terrain, or terrain to destination for the last.
+    _fwd_floors: list[float] = []
+    for _i, _leg in enumerate(_desc_legs):
+        if _i + 1 < len(_desc_legs):
+            # terrain of the NEXT segment (next leg's backward scan covers from here to there)
+            _next_terr = float(_desc_legs[_i + 1].get("max_terrain_ft") or 0)
+        else:
+            # Last leg: query terrain from here to destination
+            _next_terr = max_terrain_elevation_ft(
+                _leg["lat"], _leg["lon"],
+                destination["lat"], destination["lon"],
+            )
+        _fwd_floors.append(max(_next_terr + TERRAIN_BUFFER_FT, dest_target_ft))
+
+    _cur_alt    = float(cruise_alt)
+    _prev_cum   = desc_start_min
+    _prev_const = False   # was the previous leg terrain-constrained?
+    _extra      = []      # (ref_leg, resume_leg) pairs to splice in before ref
+
+    for _idx, _leg in enumerate(_desc_legs):
+        _cum         = float(_leg.get("_cumulative_min", _leg.get("elapsed_min", 0)))
+        _dt          = _cum - _prev_cum
+        _profile_alt = max(_cur_alt - 500.0 * _dt, dest_target_ft)
+        _floor       = _fwd_floors[_idx]
+
+        if _floor > _profile_alt:
+            # Terrain / obstacle ahead forces level-off
+            _leg["min_alt_ft"] = int(round(_floor / 100) * 100)
+            _cur_alt    = _floor
+            _prev_const = True
+            print(f"  [!] T+{_cum:.0f}min terreno adelante bloquea descenso: "
+                  f"perfil {_profile_alt:.0f}ft < mín {_floor:.0f}ft")
+        else:
+            if _prev_const:
+                # Terrain just cleared – insert "resume descent" marker before this leg
+                _resume = {
+                    "is_waypoint":      False,
+                    "is_descent":       True,
+                    "leg_num":          0,
+                    "elapsed_min":      round(_cum),
+                    "_cumulative_min":  _cum,
+                    "lat":              _leg["lat"],
+                    "lon":              _leg["lon"],
+                    "landmark":         "\u25bc Retoma descenso",
+                    "max_terrain_ft":   0,
+                    "min_alt_ft":       int(round(_cur_alt / 100) * 100),
+                    "fuel_burned_gal":  round(fuel_gph * (_cum / 60.0), 1),
+                    "segment_track_mag": _leg.get("segment_track_mag"),
+                    "alt_icao":         destination["icao"],
+                    "alt_name":         destination["name"],
+                    "alt_dist_nm":      0,
+                    "alt_freq":         "",
+                }
+                _extra.append((_leg, _resume))
+                print(f"  Retoma descenso T+{round(_cum)}min desde {int(round(_cur_alt))}ft")
+            _leg["min_alt_ft"] = int(round(_profile_alt / 100) * 100)
+            _cur_alt    = _profile_alt
+            _prev_const = False
+        _prev_cum = _cum
+
+    # Splice resume-descent rows into legs list (before their reference leg)
+    for _ref, _new in _extra:
+        legs.insert(legs.index(_ref), _new)
 
     # 4d. Viento en ruta -------------------------------------------------------
     wind_speed_kts: Optional[float] = None
@@ -1880,12 +3099,37 @@ def main() -> None:
         except Exception as exc:
             print(f"  [warn] Open-Meteo no disponible: {exc}", file=sys.stderr)
 
+    # 4e. Pista de despegue (desde CLI o auto-seleccionada por viento) ----------
+    # No se inserta fila separada — se anota el primer tramo con la pista y el
+    # tiempo real de vuelo hasta ese punto geográfico (más largo por la subida).
+    if dep_rwy_hdg is None and wind_from_deg is not None:
+        dep_rwy_hdg = best_departure_runway_mag(
+            origin["id"], origin["icao"], wind_from_deg, mag_var
+        )
+        if dep_rwy_hdg is not None:
+            rwy_num = f"{(round(dep_rwy_hdg / 10) % 36 or 36):02d}"
+            print(f"  Pista de despegue auto (viento {wind_from_deg:.0f}\u00b0V): "
+                  f"pista {rwy_num}")
+
+    if dep_rwy_hdg is not None:
+        rwy_num = f"{(round(dep_rwy_hdg / 10) % 36 or 36):02d}"
+        _first_idx = next((i for i, l in enumerate(legs) if not l.get("is_waypoint")), None)
+        if _first_idx is not None:
+            _fl = legs[_first_idx]
+            elapsed = _fl.get("elapsed_min", round(LEG_MINUTES * CLIMB_SPEED_FACTOR, 1))
+            _fl["is_departure"] = True
+            print(f"  Despegue pista {rwy_num}: primer tramo {elapsed:.1f} min "
+                  f"(same map point as {LEG_MINUTES} min at cruise speed)")
+
     # 5. Generar PDF -----------------------------------------------------------
     print("[5/5] Generando PDF...")
     wind_effect = None
     if wind_speed_kts is not None and wind_from_deg is not None:
+        # Convert IAS -> TAS for wind calculations (simple approximation)
+        tas_kts = ias_to_tas(cruise_kts, cruise_alt or 0)
+        print(f"  Usando TAS aprox {tas_kts:.1f} kt (desde IAS {cruise_kts} kt) para efecto viento")
         wind_effect = compute_wind_effect(
-            tc, cruise_kts, wind_from_deg, wind_speed_kts, total_nm, ete_min
+            tc, tas_kts, wind_from_deg, wind_speed_kts, total_nm, ete_min
         )
         wind_effect["source"]       = wind_source
         wind_effect["pressure_hpa"] = wind_level
@@ -1893,18 +3137,28 @@ def main() -> None:
               f"TEE ajustado {int(round(wind_effect['new_ete_min']))} min "
               f"({'+' if wind_effect['delta_min'] >= 0 else ''}"
               f"{wind_effect['delta_min']:.0f} min)")
-    generate_pdf(
-        output_path,
-        origin, destination,
-        cruise_kts, fuel_gph,
-        legs, descent_leg,
-        origin_freqs, dest_freqs,
-        tc, mag_var, mh,
-        total_nm, ete_min, fuel_req,
+
+    flight_data = FlightData(
+        origin=origin,
+        destination=destination,
+        tc=tc,
+        mag_var=mag_var,
+        mh=mh,
+        total_nm=total_nm,
+        ete_min=ete_min,
+        fuel_required_gal=fuel_req,
+        origin_freqs=origin_freqs,
+        dest_freqs=dest_freqs,
+        legs=legs,
+        descent_leg=descent_leg,
         cruise_alt_ft=cruise_alt,
-        one_face=args.one_face,
         wind_effect=wind_effect,
+        cruise_speed_ias=cruise_kts,
+        fuel_consumption_gph=fuel_gph,
     )
+    generate_pdf(output_path, flight_data, one_face=args.one_face)
+
+    print(f"\nListo. Abrir '{output_path}' e imprimir duplex (voltear por borde largo).\n")
 
     print(f"\nListo. Abrir '{output_path}' e imprimir duplex (voltear por borde largo).\n")
 

@@ -14,12 +14,21 @@ python3 vfr_onepager.py LEPP LEZG 100 10 --one-face -o preview.pdf
 ```
 - Low-ink design and Spanish labels by default.
 
+Recent changes (2026-04-01)
+---------------------------
+- Local SRTM1 DEM support: the generator now downloads and caches AWS "elevation-tiles-prod/skadi" HGT tiles (SRTM1) and samples terrain locally instead of always calling an elevation API. This greatly reduces network usage and improves reliability.
+- Overpass: switched to a compact node-only query and an ordered list of public Overpass instances (with a short per-endpoint timeout). Disk cache is checked before any network call so cached POIs are reused immediately.
+- PDF layout: fixed a blank-page bug in `--one-face` mode that previously inserted an empty page between the panels and the tile maps.
+- Landmark placement: visual landmark dots are now chosen to the LEFT of the aircraft and preferentially ahead-left of the track when possible.
+
 ------------
 Install into a Python 3.9+ environment:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Note: the leg minimap page requires `Pillow` (the repository's `requirements.txt` already includes `Pillow>=9.0`).
 
 Quick usage
 -----------
@@ -88,8 +97,9 @@ Behavior notes:
 What the script does
 --------------------
 - Downloads OurAirports CSVs (airports, frequencies, runways).
-- Samples terrain along the route via Open-Elevation to compute leg minimums.
-- Queries Nominatim/OSM for short landmark names (rate-limited to 1 req/s).
+ - Downloads OurAirports CSVs (airports, frequencies, runways).
+ - Samples terrain via local SRTM1 HGT tiles (auto-downloaded from AWS `elevation-tiles-prod/skadi`) and caches them under `~/.vfr_tile_cache/dem/`. If a tile cannot be downloaded the script falls back to the Open-Topo-Data API for those points.
+ - Queries Overpass (preferred) and Nominatim for short landmark names. Cache is checked before any network request and the script will rotate public Overpass instances when a service fails. If Overpass is unavailable the script falls back to Nominatim.
 - Calculates magnetic variation via the local geomag WMM library.
 - Builds legs (default 5-minute cruise legs). The first real leg's duration is adjusted to represent
 	climb time to the recommended cruise altitude (computed from origin elevation and `--climb-rate`);
@@ -98,13 +108,35 @@ What the script does
 - Adds a `Track` column with the per-segment magnetic heading and shows `T.Plan` as cumulative minutes from origin.
 - Inserts waypoint marker rows (with cumulative time/distance) and a final destination marker row in the trip table.
 
+**Leg minimap tiles (new)**
+- The PDF now includes an additional A4-landscape page with 4×3 leg minimap tiles (track-up). Each tile covers ~10 NM and is rendered using stitched OSM raster tiles.
+- Tiles are generated only if `Pillow` is available. Raster tiles and Overpass POI responses are cached under `~/.vfr_tile_cache/` to reduce network requests.
+- The tile generator displaces the track to the right so a nearby POI/landmark is visible on the left; the track is drawn through the tile to show continuity.
+
 
 Notes & tips
 -----------
 - Nominatim rate limit: the script sleeps 1s per reverse-geocode request. Building long routes may take time.
-- Open-Elevation is used for terrain sampling; network failures fall back to 0 m.
+ - Open-Topo-Data is used only as a fallback for points whose SRTM tile could not be downloaded.
 - If an alternate airport shows no frequency, it is because OurAirports has no registered freq for that field. The script now prefers alternates that have at least one frequency.
 - The generated PDF filename defaults to `<ORIG>_<DEST>_vfr.pdf` if `-o` is not provided.
+
+Troubleshooting Overpass / tiles
+ - If you see Overpass failures frequently, the script will automatically try alternative Overpass instances and use a cached response when available. You can rerun the command; cached POIs and raster tiles will be reused.
+ - Tile cache location: `~/.vfr_tile_cache/` (remove or clear this directory to force fresh tile downloads).
+ - To disable tile pages, run in an environment without `Pillow`; the rest of PDF generation will continue.
+
+Dependencies
+------------
+Install the runtime dependencies listed in `requirements.txt` into a Python 3.9+ virtualenv:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+If you don't want the minimap tiles, omit `Pillow` from the environment (the main PDF is still generated).
 
 Additional behavior and CLI options
 ----------------------------------

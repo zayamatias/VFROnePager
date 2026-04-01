@@ -2,3 +2,4 @@ reportlab>=4.0
 geopy>=2.4
 geomag>=0.9
 requests>=2.31
+Pillow>=9.0
