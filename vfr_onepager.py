@@ -75,7 +75,13 @@ OSM_TILE_URL        = "https://a.basemaps.cartocdn.com/rastertiles/voyager_nolab
 OSM_TILE_URL_LABELS = "https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}.png"
 OSM_TILE_ZOOM      = 12          # zoom level for leg tiles (good detail/speed balance)
 TILE_CACHE_DIR     = _os.path.join(_os.path.expanduser("~"), ".vfr_tile_cache")
-DEM_CACHE_DIR      = _os.path.join(TILE_CACHE_DIR, "dem")  # SRTM3 HGT tiles
+DEM_CACHE_DIR      = _os.path.join(TILE_CACHE_DIR, "dem")   # SRTM3 HGT tiles
+SAT_CACHE_DIR      = _os.path.join(TILE_CACHE_DIR, "sat")   # ESRI World Imagery tiles
+
+# ESRI World Imagery – free satellite basemap, no API key required.
+# Tile order: z / y / x  (note: NOT the usual z/x/y)
+ESRI_SAT_URL = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                "World_Imagery/MapServer/tile/{z}/{y}/{x}")
 TILE_DISPLAY_NM    = 10.0        # geographic coverage per tile side (NM)
 TILE_DISPLAY_PX    = 560         # rendered pixels per tile side
 TILE_CHKPT_X_FRAC  = 0.65        # checkpoint horiz pos (from left); track displaced right
@@ -614,10 +620,11 @@ def offset_point(lat: float, lon: float,
 
 # ---------------------------------------------------------------------------
 
-def get_landmark(lat: float, lon: float, zoom: int = 10) -> str:
+def get_landmark_with_coords(lat: float, lon: float, zoom: int = 10) -> tuple:
     """
-    Use Nominatim reverse geocoding to return a short landmark description
-    near (lat, lon).  Falls back to a lat/lon string on error.
+    Nominatim reverse geocoding. Returns (name, nom_lat, nom_lon) where
+    nom_lat/nom_lon are the coordinates of the matched OSM object (the actual
+    place centre), NOT the query point.
     Includes a polite 1-second delay to respect Nominatim usage policy.
     """
     time.sleep(1)  # Nominatim rate-limit: max 1 req/s
@@ -637,13 +644,20 @@ def get_landmark(lat: float, lon: float, zoom: int = 10) -> str:
         resp.raise_for_status()
         data = resp.json()
         display = data.get("display_name", "")
-        # Keep only the first two comma-separated components for brevity
         parts = [p.strip() for p in display.split(",")]
         short = ", ".join(parts[:2]) if len(parts) >= 2 else display
-        return short[:40]   # cap at 40 chars to fit table
+        nom_lat = float(data.get("lat", lat))
+        nom_lon = float(data.get("lon", lon))
+        return short[:40], nom_lat, nom_lon
     except Exception as exc:
         print(f"    [warn] Nominatim query failed: {exc}", file=sys.stderr)
-        return f"{lat:.3f}°N {lon:.3f}°E"
+        return f"{lat:.3f}°N {lon:.3f}°E", lat, lon
+
+
+def get_landmark(lat: float, lon: float, zoom: int = 10) -> str:
+    """Convenience wrapper — returns only the name string."""
+    name, _, _ = get_landmark_with_coords(lat, lon, zoom)
+    return name
 
 
 def _query_overpass(lat: float, lon: float, radius_m: int = 8000) -> list[dict]:
@@ -731,7 +745,8 @@ def _query_overpass(lat: float, lon: float, radius_m: int = 8000) -> list[dict]:
             continue
 
         try:
-            resp = requests.post(endpoint, data=q, timeout=20)
+            time.sleep(0.5)   # brief pause to avoid Overpass 504 rate-limiting
+            resp = requests.post(endpoint, data=q, timeout=30)
             if resp.status_code in (429, 503, 504):
                 # Rate-limited or server overloaded — cool this endpoint, try next immediately
                 OVERPASS_STATE[endpoint] = time.time()
@@ -794,105 +809,133 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
         radius_m = int(r_nm * 1852)
         try:
             found = _query_overpass(lat, lon, radius_m=radius_m)
-        except Exception:
+        except Exception as _ov_exc:
             found = []
         if found:
             candidates_all.extend(found)
-        # Stop expanding only when we have an AHEAD-LEFT (270°–360°) candidate.
-        # Behind-left candidates are never used — pilot only sees what's ahead-left.
-        if track_deg is not None and ac_lat is not None and ac_lon is not None and candidates_all:
-            try:
-                any_ahead_left = any(
-                    270 <= ((bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"]) - track_deg + 360) % 360) < 360
-                    for c in candidates_all
-                )
-            except Exception:
-                any_ahead_left = False
-            if any_ahead_left:
-                break
+            break   # stop expanding once we have results at this radius
     candidates = candidates_all
     if not candidates:
-        # no POIs found in any radius — fall back to reverse-geocode
-        return get_landmark(lat, lon, zoom=zoom), lat, lon
-
-    def _rel_bearing(c) -> float:
-        """Relative bearing of candidate c from aircraft (0=ahead, 90=right, 270=left)."""
-        brg = bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"])
-        return (brg - track_deg + 360) % 360
+        # no POIs found in any radius — fall back to reverse-geocode at the
+        # search centre (lat, lon is the 1-NM-left offset point from the caller).
+        # Use get_landmark_with_coords so we get the actual OSM object position.
+        name, nom_lat, nom_lon = get_landmark_with_coords(lat, lon, zoom=zoom)
+        return name, nom_lat, nom_lon, "poi", []
 
     # Priority ordering for tag types
     def score_candidate(c):
         t = c.get("tags", {})
-        # assign higher score to peaks, lakes, viewpoints, historic
-        if t.get("natural") == "peak":
+        # Towns/cities are the most useful VFR references — identifiable on any chart.
+        # Peaks/water are secondary (good landmarks but harder to name from the air).
+        place = t.get("place", "")
+        if place == "city":
             base = 100
-        elif t.get("water") == "lake" or t.get("natural") == "water":
+        elif place == "town":
+            base = 95
+        elif place == "village":
             base = 90
-        elif t.get("tourism") == "viewpoint":
+        elif place == "hamlet":
             base = 80
-        elif "historic" in t:
+        elif t.get("natural") == "peak":
             base = 70
-        elif t.get("man_made") == "water_tower":
-            base = 60
-        elif t.get("amenity") == "place_of_worship":
+        elif t.get("water") == "lake" or t.get("natural") == "water":
+            base = 65
+        elif t.get("tourism") == "viewpoint":
+            base = 55
+        elif "historic" in t:
             base = 50
+        elif t.get("man_made") == "water_tower":
+            base = 40
+        elif t.get("amenity") == "place_of_worship":
+            base = 30
         else:
-            # place nodes: town > village > hamlet (exact CARTO label positions)
-            place = t.get("place", "")
-            if place == "city":
-                base = 45
-            elif place == "town":
-                base = 44
-            elif place == "village":
-                base = 43
-            elif place == "hamlet":
-                base = 42
-            else:
-                base = 10
-        # Within the 270°–360° sector, give a small bonus to candidates
-        # closer to dead-ahead-left (315°) — most likely to be in the pilot's
-        # forward field of view.
+            base = 10
+        # Bonus: closest to 270° (directly left of track), falls off toward edges.
+        # A large bonus (up to +60) lets a nearby left-side historic/ruin beat a
+        # right-side town whose base score is higher but whose direction is poor.
         if track_deg is not None and ac_lat is not None and ac_lon is not None:
             try:
                 rb = _rel_bearing(c)
-                if 270 <= rb < 360:
-                    base += max(0, 20 - int(abs(rb - 315) / 5))
+                # Angular distance from direct-left (270°): 0=direct left, 90=ahead/behind
+                left_angle = abs(((rb - 270 + 180) % 360) - 180)
+                if left_angle < 90:
+                    base += max(0, 60 - int(left_angle * 2 / 3))
             except Exception:
                 pass
         return base
 
-    # ONLY use ahead-left candidates (270°–360° relative to track).
-    # Never fall back to behind-left: a reference the pilot already passed
-    # is useless for navigation.  If nothing is in the ahead-left sector,
-    # return a Nominatim reverse-geocode instead.
+    # Use ONLY left-window candidates: relative bearing 225°–315° (port side).
+    # Falls back to broader left half (180°–360°), then to a Nominatim lookup
+    # at a point 1 NM to the left of the aircraft.
     if track_deg is not None and ac_lat is not None and ac_lon is not None:
         try:
-            ahead_left = [c for c in candidates if 270 <= _rel_bearing(c) < 360]
+            left_window = [c for c in candidates
+                           if 225 <= _rel_bearing(c) <= 315]
         except Exception:
-            ahead_left = []
-        if ahead_left:
-            candidates = ahead_left
+            left_window = []
+        if left_window:
+            candidates = left_window
         else:
-            return get_landmark(lat, lon, zoom=zoom), lat, lon, "poi"
+            # Broaden to full left half-plane (anything to port)
+            try:
+                left_half = [c for c in candidates if _rel_bearing(c) >= 180]
+            except Exception:
+                left_half = []
+            if left_half:
+                candidates = left_half
+            else:
+                # Nothing to port — fall back to Nominatim at 1 NM left offset
+                _lb = (track_deg - 90 + 360) % 360
+                fb_lat, fb_lon = offset_point(
+                    ac_lat if ac_lat is not None else lat,
+                    ac_lon if ac_lon is not None else lon,
+                    _lb, 1.0)
+                name, nom_lat, nom_lon = get_landmark_with_coords(fb_lat, fb_lon, zoom=zoom)
+                return name, nom_lat, nom_lon, "poi", []
 
-    # Evaluate visibility: prefer candidates that are not clearly occluded by terrain
+    # Collect extra settlement candidates for tile labels — LEFT side only.
+    # Using the same 170°–360° half-plane filter so right-of-track towns like
+    # Arróniz never appear as orientation labels on the tile.
+    PLACE_TYPES = {"city", "town", "village", "hamlet"}
+    if track_deg is not None and ac_lat is not None and ac_lon is not None:
+        _ep_list = []
+        for _c in candidates_all:
+            if _c.get("tags", {}).get("place", "") not in PLACE_TYPES:
+                continue
+            try:
+                if _rel_bearing(_c) >= 170:
+                    _ep_list.append(_c)
+            except Exception:
+                pass
+        extra_places = _ep_list
+    else:
+        extra_places = [
+            c for c in candidates_all
+            if c.get("tags", {}).get("place", "") in PLACE_TYPES
+        ]
+
+    # Evaluate visibility: prefer candidates that are not clearly occluded by terrain.
+    # Settlements (towns/villages) are ALWAYS visible VFR references — skip terrain
+    # check for them so a valley town is never beaten by a peak solely on sight-line.
     visible = []
     search_lat = ac_lat if ac_lat is not None else lat
     search_lon = ac_lon if ac_lon is not None else lon
     for c in candidates:
         try:
-            # get POI elevation (try tag 'ele' first)
             tags = c.get("tags", {})
+            # Settlements: always considered visible (you can always identify a town)
+            if tags.get("place", "") in PLACE_TYPES:
+                visible.append((score_candidate(c), c))
+                continue
+            # For peaks / viewpoints etc.: check terrain line-of-sight
             ele = tags.get("ele")
             if ele is not None:
                 poi_elev_ft = float(ele)
             else:
                 poi_elev_m = get_elevations_m([(c["lat"], c["lon"])])[0]
                 poi_elev_ft = poi_elev_m * FEET_PER_METER
-            # terrain max between aircraft position and POI
             max_terr = max_terrain_elevation_ft(search_lat, search_lon,
                                                 c["lat"], c["lon"], samples=9)
-            # if POI elevation is at or above intervening terrain minus small buffer, consider visible
             if poi_elev_ft >= max_terr - 50:
                 visible.append((score_candidate(c), c))
         except Exception:
@@ -905,6 +948,9 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
     else:
         visible.sort(key=lambda x: x[0], reverse=True)
         best = visible[0][1]
+
+    if not extra_places:
+        extra_places = []
 
     label = best.get("name")
     poi_lat = best.get("lat", lat)
@@ -934,7 +980,7 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
         else:
             poi_type = "poi"
 
-    return (label[:40] if label else get_landmark(lat, lon, zoom=zoom), poi_lat, poi_lon, poi_type)
+    return (label[:40] if label else get_landmark(lat, lon, zoom=zoom), poi_lat, poi_lon, poi_type, extra_places)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,26 +1103,21 @@ def build_legs(origin: dict, destination: dict,
             max_terr = max_terrain_elevation_ft(prev_lat, prev_lon, lat, lon)
             min_alt  = max_terr + TERRAIN_BUFFER_FT
 
-            # Visual reference point: 45° left of track at ~8 NM lateral offset.
-            # This is the geographic area the pilot sees by turning their head
-            # left and looking down at ~45° from the cockpit vertical — like a
-            # laser from the seat pointing down-left at 45° to the vertical.
-            # We use this as the SEARCH CENTRE for Overpass, then place the dot
-            # at the actual returned POI coordinates (not at the search centre).
+            # Visual reference: search centred ~1 NM to the LEFT of the
+            # checkpoint (port window, 90° left of track).
             track_deg    = bearing_to_destination(prev_lat, prev_lon, lat, lon)
-            left_bearing = (track_deg - 90 + 360) % 360   # pure left (90°)
-            lm_lat, lm_lon = offset_point(lat, lon, left_bearing, 5.0)
-            # find_best_landmark returns (label, poi_lat, poi_lon): the poi_lat/lon
-            # are the actual OSM node coordinates, NOT the search centre.
-            # Pass track_deg + aircraft position so it can filter to left-of-track only.
+            _left_bearing = (track_deg - 90 + 360) % 360
+            _search_lat, _search_lon = offset_point(lat, lon, _left_bearing, 1.0)
+            # find_best_landmark returns (label, poi_lat, poi_lon, poi_type, extra_places).
+            # The poi_lat/lon are actual OSM node coordinates, NOT the search centre.
+            _lm_places = []
             try:
-                landmark, _lm_lat_store, _lm_lon_store, _lm_type = find_best_landmark(
-                    lm_lat, lm_lon, zoom=12, radius_nm=6.0,
+                landmark, _lm_lat_store, _lm_lon_store, _lm_type, _lm_places = find_best_landmark(
+                    _search_lat, _search_lon, zoom=12, radius_nm=4.0,
                     track_deg=track_deg, ac_lat=lat, ac_lon=lon)
             except Exception:
-                landmark = get_landmark(lm_lat, lm_lon, zoom=12)
-                _lm_lat_store = lm_lat
-                _lm_lon_store = lm_lon
+                _fb_lat, _fb_lon = offset_point(lat, lon, _left_bearing, 1.0)
+                landmark, _lm_lat_store, _lm_lon_store = get_landmark_with_coords(_fb_lat, _fb_lon, zoom=12)
                 _lm_type = "poi"
 
             # Alternativa mas cercana (excluyendo origen y destino)
@@ -1128,6 +1169,7 @@ def build_legs(origin: dict, destination: dict,
                 "lm_lat":           _lm_lat_store,
                 "lm_lon":           _lm_lon_store,
                 "lm_type":          _lm_type,
+                "lm_places":        _lm_places,
             })
 
             prev_lat, prev_lon = lat, lon
@@ -2335,11 +2377,7 @@ def _draw_poi_icon(draw, cx: int, cy: int, r: int, lm_type: str) -> None:
         draw.rectangle([cx - r, cy - r + r // 3, cx + r, cy - r + r // 3 + tw * 2],
                        fill=(140, 0, 100, 230), outline=WHITE, width=1)
     else:
-        # Map pin: filled circle + small downward pointer
-        draw.ellipse([cx - r, cy - r, cx + r, cy],
-                     fill=(50, 160, 50, 225), outline=WHITE, width=2)
-        draw.polygon([(cx - r // 2, cy), (cx + r // 2, cy), (cx, cy + r)],
-                     fill=(50, 160, 50, 225))
+        pass  # unknown type — draw nothing
 
 
 def _rotate_point_cw(px: float, py: float, cx: float, cy: float,
@@ -2355,12 +2393,123 @@ def _rotate_point_cw(px: float, py: float, cx: float, cy: float,
     return cx + rx, cy + ry
 
 
+def _zoom_from_altitude(alt_ft: float, lat: float) -> int:
+    """
+    Return an ESRI tile zoom level so satellite tiles show approximately
+    the ground footprint visible to a pilot at the given altitude.
+
+    Assumes a 60° horizontal field of view (2 × tan 30° ≈ 1.155 × altitude).
+    Result is clamped to [10, 17] to avoid fetching hundreds of tiles or
+    requesting zoom levels ESRI doesn't support in remote areas.
+    """
+    H_m       = max(alt_ft, 300) * 0.3048           # clamp to avoid edge cases
+    vis_m     = H_m * 2 * math.tan(math.radians(30))  # 60° FOV ground width
+    nm_vis    = vis_m / 1852.0
+    TILE_PX   = 256
+    cos_lat   = math.cos(math.radians(lat))
+    # smallest z where crop_px >= TILE_DISPLAY_PX (resize is a downsample, not upsample)
+    # sat_nm_per_px(z) = (360 / (TILE_PX * 2^z)) * 60 * cos_lat
+    # crop_px = nm_vis / sat_nm_per_px = nm_vis * TILE_PX * 2^z / (360 * 60 * cos_lat)
+    # crop_px >= TILE_DISPLAY_PX  =>  z >= log2(TILE_DISPLAY_PX * 360 * 60 * cos_lat / (TILE_PX * nm_vis))
+    z_ideal = math.log2(TILE_DISPLAY_PX * 360 * 60 * cos_lat / (TILE_PX * nm_vis))
+    return int(min(17, max(10, round(z_ideal))))
+
+
+def _fetch_esri_sat_tile(z: int, x: int, y: int):
+    """
+    Fetch (with disk cache) a single 256×256 ESRI World Imagery satellite tile.
+    Returns a PIL RGBA Image, or a grey fallback if unavailable.
+    Note: ESRI tile URL uses z/y/x order.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    _os.makedirs(SAT_CACHE_DIR, exist_ok=True)
+    cache_path = _os.path.join(SAT_CACHE_DIR, f"{z}_{x}_{y}.jpg")
+    if _os.path.exists(cache_path):
+        try:
+            return Image.open(cache_path).convert("RGBA")
+        except Exception:
+            pass
+    url = ESRI_SAT_URL.format(z=z, y=y, x=x)
+    try:
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "VFROnePager/1.0 (educational)"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+        try:
+            img.save(cache_path, "JPEG", quality=85)
+        except Exception:
+            pass
+        return img
+    except Exception as exc:
+        print(f"    [warn] ESRI sat tile {z}/{y}/{x}: {exc}", file=sys.stderr)
+        return Image.new("RGBA", (256, 256), (100, 100, 100, 255))
+
+
+def _get_stitched_satellite(center_lat: float, center_lon: float,
+                            half_nm: float, zoom: int = OSM_TILE_ZOOM):
+    """
+    Fetch and stitch ESRI World Imagery tiles covering ±half_nm from center.
+    Returns (sat_img, geo_info) with the same geo_info format as _get_stitched_map,
+    or (None, None) if Pillow is unavailable.
+    sat_img is RGBA so it can be alpha-composited with the OSM layers.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, None
+
+    half_lat = half_nm / 60.0
+    half_lon = half_lat / math.cos(math.radians(center_lat))
+
+    lat_top  = center_lat + half_lat
+    lat_bot  = center_lat - half_lat
+    lon_left = center_lon - half_lon
+    lon_right = center_lon + half_lon
+
+    tx_left,  ty_top = _osm_tile_num(lat_top,  lon_left,  zoom)
+    tx_right, ty_bot = _osm_tile_num(lat_bot,  lon_right, zoom)
+    tx_left,  tx_right = min(tx_left, tx_right), max(tx_left, tx_right)
+    ty_top,   ty_bot   = min(ty_top,  ty_bot),   max(ty_top,  ty_bot)
+
+    n_x = tx_right - tx_left + 1
+    n_y = ty_bot   - ty_top  + 1
+
+    TILE_PX  = 256
+    stitched = Image.new("RGBA", (n_x * TILE_PX, n_y * TILE_PX), (80, 80, 80, 255))
+    for ix in range(n_x):
+        for iy in range(n_y):
+            t = _fetch_esri_sat_tile(zoom, tx_left + ix, ty_top + iy)
+            if t:
+                stitched.paste(t, (ix * TILE_PX, iy * TILE_PX))
+
+    nw_lat, nw_lon = _tile_nw_latlon(tx_left,      ty_top,    zoom)
+    se_lat, se_lon = _tile_nw_latlon(tx_right + 1, ty_bot + 1, zoom)
+
+    w, h = stitched.size
+    geo = {
+        "lat_top":    nw_lat,
+        "lon_left":   nw_lon,
+        "lat_per_px": (nw_lat - se_lat) / h,
+        "lon_per_px": (se_lon - nw_lon) / w,
+    }
+    return stitched, geo
+
+
 def _build_tile_image(leg_lat: float, leg_lon: float,
                       bearing_deg: float,
                       lm_lat: float, lm_lon: float,
                       lm_label: str, lm_type: str,
                       leg_num: int, cum_min: int,
-                      is_dest: bool = False):
+                      is_dest: bool = False,
+                      bg_mode: str = "osm",
+                      alt_ft: float = 5000.0,
+                      extra_places: list = None):
     """
     Build a track-up minimap PIL Image for a single leg checkpoint.
 
@@ -2378,9 +2527,9 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
         print("  [warn] Pillow not installed – skipping leg tile minimap.", file=sys.stderr)
         return None
 
-    # ── Step 1: fetch stitched map centred on the leg checkpoint ──────────
+    # ── Step 1: fetch stitched map centred on the LANDMARK (visual reference) ──
     CANVAS_HALF_NM = TILE_DISPLAY_NM * 1.5   # large enough to survive any rotation
-    raw_img, raw_labels, geo = _get_stitched_map(leg_lat, leg_lon, CANVAS_HALF_NM)
+    raw_img, raw_labels, geo = _get_stitched_map(lm_lat, lm_lon, CANVAS_HALF_NM)
     if raw_img is None or geo is None:
         return None
 
@@ -2389,7 +2538,7 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
     # ── Step 2: compute the GEOGRAPHIC (Mercator-conformal) pixel scale ───
     # OSM tiles in web-Mercator are conformal: nm/px is equal in x and y.
     # 1° lon at latitude φ = 60·cos(φ) NM.  geo["lon_per_px"] is deg/px in x.
-    nm_per_px = geo["lon_per_px"] * 60.0 * math.cos(math.radians(leg_lat))
+    nm_per_px = geo["lon_per_px"] * 60.0 * math.cos(math.radians(lm_lat))
     if nm_per_px <= 0:
         return None
 
@@ -2423,10 +2572,25 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
     cx_r, cy_r = _rotate_point_cw(cx_raw, cy_raw, img_cx, img_cy, bearing_deg)
     lx_r, ly_r = _rotate_point_cw(lx_raw, ly_raw, img_cx, img_cy, bearing_deg)
 
-    # ── Step 6: crop a square of crop_px × crop_px, placing the checkpoint
-    #            at (TILE_CHKPT_X_FRAC, TILE_CHKPT_Y_FRAC) in the crop ────
-    crop_l = int(round(cx_r - crop_px * TILE_CHKPT_X_FRAC))
-    crop_t = int(round(cy_r - crop_px * TILE_CHKPT_Y_FRAC))
+    # ── Step 6: crop placing the LANDMARK at (0.30, 0.50) in the tile ──────
+    # Landmark is to the LEFT of track (port side); aircraft is to the right.
+    # Placing landmark at x=0.30 keeps it visible on the left while giving
+    # 70% of tile width for the aircraft/track line on the right.
+    _LM_X = 0.30
+    _LM_Y = 0.50
+    crop_l = int(round(lx_r - crop_px * _LM_X))
+    crop_t = int(round(ly_r - crop_px * _LM_Y))
+    disp_scale = TILE_DISPLAY_PX / crop_px
+
+    # ── Track-visibility clamp ─────────────────────────────────────────────
+    # If the checkpoint (track line) would land outside a 10% inset from either
+    # edge, shift crop_l so the track is always visible in the tile.
+    _TRACK_MARGIN = crop_px * 0.10
+    _raw_chk_x = cx_r - crop_l
+    if _raw_chk_x < _TRACK_MARGIN:
+        crop_l = int(round(cx_r - _TRACK_MARGIN))
+    elif _raw_chk_x > crop_px - _TRACK_MARGIN:
+        crop_l = int(round(cx_r - (crop_px - _TRACK_MARGIN)))
 
     # Pad the rotated image so the crop window is always within valid pixels.
     pad = crop_px
@@ -2437,43 +2601,126 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
 
     # ── Step 7: resize the square crop to TILE_DISPLAY_PX ─────────────────
     tile = tile.resize((TILE_DISPLAY_PX, TILE_DISPLAY_PX), Image.LANCZOS)
-    disp_scale = TILE_DISPLAY_PX / crop_px
 
-    # Overlay pixel positions after resize.
-    # IMPORTANT: use RAW (unrotated) coords for the landmark so it lines up
-    # with the CARTO labels overlay, which is also cropped without rotation.
-    chkpt_x = int(TILE_DISPLAY_PX * TILE_CHKPT_X_FRAC)
-    chkpt_y = int(TILE_DISPLAY_PX * TILE_CHKPT_Y_FRAC)
-    lx_tile = (lx_raw - cx_raw + crop_px * TILE_CHKPT_X_FRAC) * disp_scale
-    ly_tile = (ly_raw - cy_raw + crop_px * TILE_CHKPT_Y_FRAC) * disp_scale
+    # Landmark and checkpoint pixel positions derived from the (clamped) crop origin.
+    lx_tile = (lx_r - crop_l) * disp_scale
+    ly_tile = (ly_r - crop_t) * disp_scale
+    chkpt_x = int(round((cx_r - crop_l) * disp_scale))
+    chkpt_y = int(round((cy_r - crop_t) * disp_scale))
 
-    # ── Step 8: composite horizontal labels onto the rotated base ──────────
-    # The labels layer (CARTO voyager_only_labels) is a transparent PNG with
-    # all text rendered in the source map's coordinate space (north-up).
-    # We crop it WITHOUT rotating – this keeps every word horizontal on the
-    # final tile regardless of track bearing.  The crop is aligned so that the
-    # checkpoint sits at the same (TILE_CHKPT_X_FRAC, TILE_CHKPT_Y_FRAC) as in
-    # the base, so town/road labels remain close to their true geographic
-    # positions.  For typical VFR bearings the positional accuracy is excellent
-    # near the checkpoint and degrades toward tile edges; this is acceptable for
-    # inflight area recognition.
-    if raw_labels is not None:
+    # _lbl_crop_px: how many OSM-scale pixels correspond to the final tile viewport.
+    # For OSM mode this equals crop_px; for satellite we override it below so
+    # the rotated labels layer covers the same geographic area as the sat view.
+    _lbl_crop_px = crop_px
+
+    # ── Step 7b: satellite background (only when bg_mode == "satellite") ───
+    # Uses a SEPARATE rotation/crop pipeline from the OSM one (different zoom
+    # level and geographic footprint).  The zoom is derived from flight altitude
+    # so the resulting tile shows roughly what the pilot sees out the window.
+    # lx_tile / ly_tile are updated to match the satellite coordinate space.
+    if bg_mode == "satellite":
         try:
-            lbl_crop_l = int(round(cx_raw - crop_px * TILE_CHKPT_X_FRAC))
-            lbl_crop_t = int(round(cy_raw - crop_px * TILE_CHKPT_Y_FRAC))
-            lbl_pad = crop_px  # same padding strategy as the base layer
-            lbl_padded = Image.new("RGBA",
-                                   (orig_w + 2 * lbl_pad, orig_h + 2 * lbl_pad),
-                                   (0, 0, 0, 0))
-            lbl_padded.paste(raw_labels, (lbl_pad, lbl_pad))
+            sat_zoom    = _zoom_from_altitude(alt_ft, leg_lat)
+            # Geographic footprint for the satellite tile (altitude-based)
+            H_m         = max(alt_ft, 300) * 0.3048
+            sat_disp_nm = H_m * 2 * math.tan(math.radians(30)) / 1852.0
+            sat_canvas  = sat_disp_nm * 1.5          # canvas margin (survive rotation)
+            # Labels crop in OSM-scale pixels matching the satellite viewport
+            _lbl_crop_px = max(64, int(round(sat_disp_nm / nm_per_px)))
+            sat_raw, sat_geo = _get_stitched_satellite(
+                lm_lat, lm_lon, sat_canvas, zoom=sat_zoom)
+            if sat_raw is not None and sat_geo is not None:
+                sat_ow, sat_oh  = sat_raw.size
+                sat_icx = sat_ow / 2.0
+                sat_icy = sat_oh / 2.0
+                # Checkpoint pixel in satellite image
+                sat_cx_raw = (leg_lon - sat_geo["lon_left"]) / sat_geo["lon_per_px"]
+                sat_cy_raw = (sat_geo["lat_top"] - leg_lat)  / sat_geo["lat_per_px"]
+                # Landmark pixel in satellite image
+                sat_lx_raw = (lm_lon - sat_geo["lon_left"]) / sat_geo["lon_per_px"]
+                sat_ly_raw = (sat_geo["lat_top"] - lm_lat)  / sat_geo["lat_per_px"]
+                # NM per pixel at this zoom level
+                sat_nm_px  = sat_geo["lon_per_px"] * 60.0 * math.cos(math.radians(leg_lat))
+                sat_crop_px = max(64, int(round(sat_disp_nm / sat_nm_px)))
+                # Rotate satellite canvas CCW by bearing_deg (track-up)
+                # Same as OSM: PIL.rotate(+θ) = CCW, which puts the track
+                # direction at the top of the tile.
+                sat_rotated = sat_raw.rotate(
+                    bearing_deg,
+                    resample=Image.BICUBIC,
+                    expand=False,
+                    center=(int(sat_icx), int(sat_icy)),
+                    fillcolor=(80, 80, 80, 255),
+                )
+                # Rotate coords with same transform
+                sat_cx_r, sat_cy_r = _rotate_point_cw(
+                    sat_cx_raw, sat_cy_raw, sat_icx, sat_icy, bearing_deg)
+                sat_lx_r, sat_ly_r = _rotate_point_cw(
+                    sat_lx_raw, sat_ly_raw, sat_icx, sat_icy, bearing_deg)
+                # Crop placing landmark at (_LM_X, _LM_Y) — same as OSM pipeline.
+                sat_crop_l = int(round(sat_lx_r - sat_crop_px * _LM_X))
+                sat_crop_t = int(round(sat_ly_r - sat_crop_px * _LM_Y))
+                sat_disp_scale = TILE_DISPLAY_PX / sat_crop_px
+                # Track-visibility clamp for satellite pipeline
+                _sat_track_margin = sat_crop_px * 0.10
+                _sat_raw_chk_x = sat_cx_r - sat_crop_l
+                if _sat_raw_chk_x < _sat_track_margin:
+                    sat_crop_l = int(round(sat_cx_r - _sat_track_margin))
+                elif _sat_raw_chk_x > sat_crop_px - _sat_track_margin:
+                    sat_crop_l = int(round(sat_cx_r - (sat_crop_px - _sat_track_margin)))
+                sat_pad    = sat_crop_px
+                sat_padded = Image.new(
+                    "RGBA",
+                    (sat_ow + 2 * sat_pad, sat_oh + 2 * sat_pad),
+                    (80, 80, 80, 255),
+                )
+                sat_padded.paste(sat_rotated, (sat_pad, sat_pad))
+                sat_cropped = sat_padded.crop((
+                    sat_crop_l + sat_pad, sat_crop_t + sat_pad,
+                    sat_crop_l + sat_pad + sat_crop_px,
+                    sat_crop_t + sat_pad + sat_crop_px,
+                ))
+                tile = sat_cropped.resize(
+                    (TILE_DISPLAY_PX, TILE_DISPLAY_PX), Image.LANCZOS
+                ).convert("RGBA")
+                # Pixel positions derived from the (clamped) satellite crop origin.
+                lx_tile = (sat_lx_r - sat_crop_l) * sat_disp_scale
+                ly_tile = (sat_ly_r - sat_crop_t) * sat_disp_scale
+                chkpt_x = int(round((sat_cx_r - sat_crop_l) * sat_disp_scale))
+                chkpt_y = int(round((sat_cy_r - sat_crop_t) * sat_disp_scale))
+        except Exception as _sat_exc:
+            print(f" [sat-warn: {_sat_exc}]", end="", file=sys.stderr)
+            pass  # satellite fetch failed → keep OSM fallback
+
+    # ── Step 8: composite CARTO labels (correctly rotated) ──────────────────
+    # Rotate the labels layer with the SAME transform as the base image so
+    # town/city names appear in their correct track-up positions.
+    # Skipped for satellite mode — labels are too large/opaque over aerial photos;
+    # the small settlement dots drawn later provide sufficient orientation.
+    if raw_labels is not None and bg_mode != "satellite":
+        try:
+            rot_lbl = raw_labels.rotate(
+                bearing_deg,
+                resample=Image.BICUBIC,
+                expand=False,
+                center=(int(img_cx), int(img_cy)),
+                fillcolor=(0, 0, 0, 0),
+            )
+            lbl_pad = crop_px
+            lbl_padded = Image.new(
+                "RGBA", (orig_w + 2 * lbl_pad, orig_h + 2 * lbl_pad), (0, 0, 0, 0))
+            lbl_padded.paste(rot_lbl, (lbl_pad, lbl_pad))
+            # Use the same (potentially clamped) crop origin as the base tile
+            # so labels are always registered to the visible map area.
+            lbl_crop_l = crop_l
+            lbl_crop_t = crop_t
             lbl_crop = lbl_padded.crop((
                 lbl_crop_l + lbl_pad,
                 lbl_crop_t + lbl_pad,
-                lbl_crop_l + lbl_pad + crop_px,
-                lbl_crop_t + lbl_pad + crop_px,
+                lbl_crop_l + lbl_pad + _lbl_crop_px,
+                lbl_crop_t + lbl_pad + _lbl_crop_px,
             ))
-            lbl_tile = lbl_crop.resize((TILE_DISPLAY_PX, TILE_DISPLAY_PX),
-                                       Image.LANCZOS)
+            lbl_tile = lbl_crop.resize((TILE_DISPLAY_PX, TILE_DISPLAY_PX), Image.LANCZOS)
             tile = Image.alpha_composite(tile.convert("RGBA"), lbl_tile)
         except Exception:
             pass  # labels composite failure is non-fatal
@@ -2484,8 +2731,7 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
     # Track line:
     #  - en-route: full height (shows track continuing beyond checkpoint)
     #  - destination: only bottom → checkpoint (you're arriving, not continuing)
-    chkpt_x = int(TILE_DISPLAY_PX * TILE_CHKPT_X_FRAC)
-    chkpt_y = int(TILE_DISPLAY_PX * TILE_CHKPT_Y_FRAC)
+    # chkpt_x/y were computed from geometry above (both OSM and satellite modes).
     if is_dest:
         draw.line([(chkpt_x, TILE_DISPLAY_PX), (chkpt_x, chkpt_y)],
                   fill=(0, 160, 0, 220), width=3)
@@ -2539,7 +2785,8 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
             except Exception:
                 _font = ImageFont.load_default()
 
-        # Cartographic icon next to the landmark dot based on `lm_type`.
+        # Draw a small cartographic icon next to the landmark dot to indicate
+        # the POI type (peak symbol, church cross, lake, etc.).
         try:
             icon_r = 11
             ix = lx_i + R2 + icon_r + 4
@@ -2578,6 +2825,59 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
         paste_y = max(2, min(paste_y, TILE_DISPLAY_PX - rx_h - 2))
         tile.paste(txt_img, (paste_x, paste_y), txt_img)
 
+    # ── Draw extra settlement labels (towns/villages from Overpass candidates) ──
+    # These give the pilot additional orientation references beyond the main landmark.
+    # Only draw settlements that fall within the tile's visible area.
+    if extra_places:
+        try:
+            _efont = _font  # reuse the same font loaded above
+        except Exception:
+            _efont = None
+        for ep in extra_places:
+            ep_lat = ep.get("lat")
+            ep_lon = ep.get("lon")
+            ep_name = ep.get("name", "")
+            if ep_lat is None or ep_lon is None or not ep_name:
+                continue
+            # Skip if this is the main landmark (already drawn with full icon)
+            if abs(ep_lat - lm_lat) < 0.0001 and abs(ep_lon - lm_lon) < 0.0001:
+                continue
+            try:
+                # Pixel in raw image
+                ep_x_raw = (ep_lon - geo["lon_left"]) / geo["lon_per_px"]
+                ep_y_raw = (geo["lat_top"] - ep_lat)  / geo["lat_per_px"]
+                # Apply same rotation as the base image
+                ep_x_r, ep_y_r = _rotate_point_cw(ep_x_raw, ep_y_raw, img_cx, img_cy, bearing_deg)
+                # Convert to tile pixel coords (using OSM pipeline geometry)
+                ep_tx = int(round((ep_x_r - lx_r + crop_px * _LM_X) * disp_scale))
+                ep_ty = int(round((ep_y_r - ly_r + crop_px * _LM_Y) * disp_scale))
+                margin = 20
+                if not (margin < ep_tx < TILE_DISPLAY_PX - margin and
+                        margin < ep_ty < TILE_DISPLAY_PX - margin):
+                    continue
+                # Small grey settlement dot
+                R_ep = 4
+                draw.ellipse([ep_tx - R_ep, ep_ty - R_ep, ep_tx + R_ep, ep_ty + R_ep],
+                             fill=(80, 80, 200, 180), outline=(255, 255, 255, 200), width=1)
+                # Small label with white outline
+                ep_short = ep_name[:22]
+                if _efont:
+                    try:
+                        _eb = _efont.getbbox(ep_short)
+                        ew, eh = _eb[2] - _eb[0], _eb[3] - _eb[1]
+                    except Exception:
+                        ew = max(16, len(ep_short) * 6); eh = 11
+                    ep_lbl = Image.new("RGBA", (ew + 6, eh + 4), (0, 0, 0, 0))
+                    ed = ImageDraw.Draw(ep_lbl)
+                    for ox, oy in [(-1,-1),(0,-1),(1,-1),(-1,0),(1,0),(-1,1),(0,1),(1,1)]:
+                        ed.text((3 + ox, 2 + oy), ep_short, fill=(255,255,255,230), font=_efont)
+                    ed.text((3, 2), ep_short, fill=(30, 30, 120, 255), font=_efont)
+                    px2 = max(2, min(ep_tx - ew // 2, TILE_DISPLAY_PX - ew - 6))
+                    py2 = max(2, min(ep_ty + R_ep + 2, TILE_DISPLAY_PX - eh - 4))
+                    tile.paste(ep_lbl, (px2, py2), ep_lbl)
+            except Exception:
+                continue
+
     # Header bar (semi-transparent dark strip at top of tile)
     header_h = 22
     hdr_bg = (0, 100, 0, 190) if is_dest else (30, 30, 30, 180)
@@ -2607,11 +2907,423 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
     return tile.convert("RGB")
 
 
+# ---------------------------------------------------------------------------
+# Terrain silhouette (forward-view from aircraft)
+# ---------------------------------------------------------------------------
+
+def _build_silhouette_image(ac_lat: float, ac_lon: float,
+                            bearing_deg: float,
+                            alt_ft: float,
+                            width_px: int = 400,
+                            height_px: int = 220,
+                            fov_deg: float = 60.0,
+                            max_range_nm: float = 30.0,
+                            ray_steps: int = 300) -> "Image":
+    """
+    Render a forward-looking terrain silhouette from the aircraft position.
+
+    The view is centred on 'bearing_deg' with a horizontal FOV of 'fov_deg'.
+    For each column of pixels the highest terrain angle above/below horizontal
+    is found by ray-marching outward to max_range_nm.  Terrain is drawn as a
+    filled dark shape below the sky.
+
+    Sky: light blue gradient (bright near horizon, dark blue at top).
+    Terrain: dark brownish silhouette gradient (lighter = closer to viewer).
+    Bearing tick + horizon line drawn in the centre column.
+
+    Returns a Pillow RGBA Image or None on error.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+
+    img = Image.new("RGBA", (width_px, height_px), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # ----- sky gradient (top=deep blue, middle=light sky) -----
+    sky_top    = (30,  60, 140)
+    sky_horiz  = (160, 200, 240)
+    for y in range(height_px):
+        t = y / (height_px - 1)          # 0=top, 1=bottom
+        r = int(sky_top[0] + (sky_horiz[0] - sky_top[0]) * t)
+        g = int(sky_top[1] + (sky_horiz[1] - sky_top[1]) * t)
+        b = int(sky_top[2] + (sky_horiz[2] - sky_top[2]) * t)
+        draw.line([(0, y), (width_px - 1, y)], fill=(r, g, b, 255))
+
+    ac_elev_m  = get_elevations_m([(ac_lat, ac_lon)])[0]
+    ac_elev_ft = ac_elev_m * FEET_PER_METER
+    # Aircraft altitude AGL → used as eye height above terrain
+    eye_agl_ft  = max(alt_ft - ac_elev_ft, 300.0)
+    eye_agl_m   = eye_agl_ft * 0.3048
+
+    # Vertical FOV: we'll display ±vfov_deg above/below horizontal
+    vfov_deg   = 15.0
+    # pixel-to-angle mapping: centre row = 0°, top = +vfov_deg, bottom = -vfov_deg
+    # Positive angle = above horizon
+    def _angle_to_y(angle_deg: float) -> int:
+        """Angle above horizon → pixel row (0=top, height_px-1=bottom)."""
+        frac = 0.5 - angle_deg / (2.0 * vfov_deg)   # 0=top, 1=bottom
+        return int(round(frac * (height_px - 1)))
+
+    horizon_y = _angle_to_y(0.0)
+
+    # ---- ray-march each column ----
+    # step sizes: logarithmic — dense near aircraft, sparse far away
+    # Build distance samples 0.05 NM → max_range_nm
+    distances_nm = []
+    d = 0.05
+    while d <= max_range_nm:
+        distances_nm.append(d)
+        # grow step gradually: fine near, coarser far
+        d += max(0.05, d * 0.03)
+
+    half_fov   = fov_deg / 2.0
+    sky_profile = [height_px] * width_px  # y where terrain starts for each column
+
+    for col in range(width_px):
+        # Bearing for this column: bearing_deg ± half_fov
+        col_frac   = col / (width_px - 1)          # 0=left, 1=right
+        col_bear   = (bearing_deg - half_fov + col_frac * fov_deg + 360) % 360
+        max_angle  = -90.0   # highest terrain angle found so far for this ray
+
+        for dist_nm in distances_nm:
+            pt_lat, pt_lon = offset_point(ac_lat, ac_lon, col_bear, dist_nm)
+            try:
+                terr_m = get_elevations_m([(pt_lat, pt_lon)])[0]
+            except Exception:
+                continue
+            dist_m = dist_nm * 1852.0
+            # Angle above horizontal from eye to terrain surface
+            dh_m   = terr_m - (ac_elev_m + eye_agl_m)
+            angle  = math.degrees(math.atan2(dh_m, dist_m))
+            if angle > max_angle:
+                max_angle = angle
+
+        # Convert highest angle to pixel row
+        top_y = _angle_to_y(max_angle)
+        top_y = max(0, min(height_px, top_y))
+        sky_profile[col] = top_y
+
+    # ---- fill terrain ----
+    # terrain colour: rocky grey-brown — lighter at ridgeline, darker/warmer towards base
+    for col in range(width_px):
+        top_y = sky_profile[col]
+        for y in range(top_y, height_px):
+            depth = (y - top_y) / max(1, height_px - top_y)  # 0=ridge, 1=base
+            # ridge: cool grey (110,100,90); base: warm dark brown (55,45,35)
+            r = int(110 - depth * 55)
+            g = int(100 - depth * 55)
+            b = int(90  - depth * 55)
+            draw.point((col, y), fill=(r, g, b, 255))
+
+    # Slightly brighten the ridge line for contrast
+    for col in range(width_px):
+        ty = sky_profile[col]
+        for dy in range(3):
+            y = ty + dy
+            if 0 <= y < height_px:
+                old = img.getpixel((col, y))
+                bright = tuple(min(255, v + 50) for v in old[:3]) + (255,)
+                img.putpixel((col, y), bright)
+
+    # ---- overlays ----
+    draw = ImageDraw.Draw(img)   # re-create after putpixel calls
+
+    # Horizon dashed line
+    dash_col = (255, 255, 255, 100)
+    for x in range(0, width_px, 8):
+        if x % 16 < 8:
+            draw.line([(x, horizon_y), (min(x + 7, width_px - 1), horizon_y)],
+                      fill=dash_col, width=1)
+
+    # Centre bearing tick at bottom
+    cx = width_px // 2
+    draw.line([(cx, height_px - 1), (cx, height_px - 12)],
+              fill=(255, 220, 0, 220), width=2)
+    draw.line([(cx - 15, height_px - 6), (cx + 15, height_px - 6)],
+              fill=(255, 220, 0, 180), width=1)
+
+    # Bearing label at bottom centre
+    try:
+        _font = ImageFont.truetype("arial.ttf", 11)
+    except Exception:
+        _font = ImageFont.load_default()
+    bear_lbl = f"{int(round(bearing_deg))}°"
+    try:
+        bb = _font.getbbox(bear_lbl)
+        lw = bb[2] - bb[0]
+    except Exception:
+        lw = len(bear_lbl) * 7
+    draw.text((cx - lw // 2, height_px - 26), bear_lbl,
+              fill=(255, 220, 0, 230), font=_font)
+
+    # Left/right bearing ticks
+    for side, sign in (("L", -1), ("R", 1)):
+        sx = cx + sign * (width_px // 2 - 6)
+        edge_bear = (bearing_deg + sign * half_fov + 360) % 360
+        elbl = f"{int(round(edge_bear))}°"
+        try:
+            bb2 = _font.getbbox(elbl); ew = bb2[2] - bb2[0]
+        except Exception:
+            ew = len(elbl) * 7
+        ex = max(2, min(sx - ew // 2, width_px - ew - 2))
+        draw.text((ex, height_px - 26), elbl, fill=(200, 220, 255, 180), font=_font)
+
+    # ---- peak annotations: visible summit arrows ----
+    try:
+        peak_radius_m = int(max_range_nm * 1852)
+        all_cands = _query_overpass(ac_lat, ac_lon, radius_m=peak_radius_m)
+        peaks_in_fov = []
+        for cand in all_cands:
+            tags = cand.get("tags", {})
+            if tags.get("natural") != "peak":
+                continue
+            pk_lat = float(cand["lat"])
+            pk_lon = float(cand["lon"])
+            dist_nm = gc_distance_nm(ac_lat, ac_lon, pk_lat, pk_lon)
+            if dist_nm < 0.3 or dist_nm > max_range_nm:
+                continue
+            bear_to_pk = bearing_to_destination(ac_lat, ac_lon, pk_lat, pk_lon)
+            # Signed angular offset from centre bearing: negative=left, positive=right
+            rel = (bear_to_pk - bearing_deg + 360) % 360
+            if rel > 180:
+                rel -= 360
+            if abs(rel) > half_fov:
+                continue
+            # Screen column (left edge = -half_fov, right edge = +half_fov)
+            col = int(round((rel + half_fov) / fov_deg * (width_px - 1)))
+            col = max(0, min(width_px - 1, col))
+            # Elevation angle from aircraft eye to peak summit
+            pk_elev_m = get_elevations_m([(pk_lat, pk_lon)])[0]
+            dist_m = dist_nm * 1852.0
+            dh_m = pk_elev_m - (ac_elev_m + eye_agl_m)
+            pk_angle = math.degrees(math.atan2(dh_m, dist_m))
+            # Ridge angle at this column (inverse of _angle_to_y)
+            ridge_y = sky_profile[col]
+            ridge_angle = vfov_deg * (0.5 - ridge_y / max(1, height_px - 1)) * 2
+            # Only annotate if peak is not hidden behind the closer terrain
+            # (its elevation angle must be within 1.5° below the local ridgeline)
+            if pk_angle < ridge_angle - 1.5:
+                continue
+            pk_name = cand.get("name", "")
+            # Elevation in feet: prefer OSM ele tag, fall back to DEM height
+            ele_tag = tags.get("ele")
+            try:
+                ele_m = float(ele_tag) if ele_tag else pk_elev_m
+                ele_ft = int(round(ele_m * 3.28084))
+            except Exception:
+                ele_ft = None
+            peaks_in_fov.append((col, ridge_y, pk_name, dist_nm, pk_angle, ele_ft))
+
+        # Sort by distance so closer peaks paint last (on top)
+        peaks_in_fov.sort(key=lambda t: -t[3])
+
+        # Simple de-overlap: suppress peaks whose screen column is too close to
+        # an already-drawn peak (avoid pile-up of labels in narrow ridgelines)
+        used_cols: list[int] = []
+        min_col_gap = 50   # pixels
+
+        for col, ridge_y, pk_name, dist_nm, pk_ang, ele_ft in peaks_in_fov:
+            if any(abs(col - uc) < min_col_gap for uc in used_cols):
+                continue
+            used_cols.append(col)
+
+            # Upward-pointing filled triangle just above the ridgeline
+            arr_base_y = max(2, ridge_y - 3)
+            arr_tip_y  = max(0, arr_base_y - 14)
+            draw.polygon(
+                [(col, arr_tip_y), (col - 5, arr_base_y), (col + 5, arr_base_y)],
+                fill=(255, 215, 0, 230),
+            )
+
+            # Two-line label: name (line 1) + elevation in ft (line 2)
+            name_lbl = pk_name if len(pk_name) <= 16 else pk_name[:15] + "…"
+            ele_lbl  = f"{ele_ft:,} ft".replace(",", "\u202f") if ele_ft is not None else ""
+            try:
+                bb_n = _font.getbbox(name_lbl)
+                nw, nh = bb_n[2] - bb_n[0], bb_n[3] - bb_n[1]
+            except Exception:
+                nw, nh = len(name_lbl) * 6, 10
+            try:
+                bb_e = _font.getbbox(ele_lbl)
+                ew2, eh = bb_e[2] - bb_e[0], bb_e[3] - bb_e[1]
+            except Exception:
+                ew2, eh = len(ele_lbl) * 6, 10
+
+            box_w   = max(nw, ew2) + 6
+            box_h   = nh + eh + 6
+            # Position label box above triangle tip, stem gap = 4px
+            stem_gap = 4
+            box_bot = arr_tip_y - stem_gap
+            box_top = box_bot - box_h
+            box_top = max(1, box_top)
+            box_bot = box_top + box_h
+            bx = max(2, min(col - box_w // 2, width_px - box_w - 2))
+
+            # Vertical stem line from box bottom to arrow tip
+            draw.line([(col, box_bot), (col, arr_tip_y)],
+                      fill=(255, 215, 0, 180), width=1)
+
+            # Semi-transparent dark background box
+            from PIL import Image as _PILImg2
+            box_ov = _PILImg2.new("RGBA", (box_w, box_h), (10, 10, 10, 170))
+            img.paste(box_ov, (bx, box_top), box_ov)
+            draw = ImageDraw.Draw(img)  # refresh draw after paste
+
+            # Name text (white, centred in box)
+            nx = bx + (box_w - nw) // 2
+            draw.text((nx, box_top + 2), name_lbl, fill=(255, 255, 255, 240), font=_font)
+            # Elevation text (yellow, centred below)
+            ex2 = bx + (box_w - ew2) // 2
+            draw.text((ex2, box_top + 2 + nh + 1), ele_lbl, fill=(255, 215, 80, 230), font=_font)
+    except Exception:
+        pass   # never let peak annotation crash the silhouette render
+
+    return img.convert("RGB")
+
+
+def draw_silhouette_page(c: "canvas.Canvas", legs: list, data: "FlightData",
+                         page_w: float, page_h: float) -> None:
+    """
+    Draw a new PDF page of forward-view terrain silhouettes, one per leg tile.
+    Layout mirrors the OSM/satellite tile pages: 4 cols × 3 rows.
+    """
+    try:
+        from PIL import Image
+        import io as _io3
+        from reportlab.lib.utils import ImageReader
+    except ImportError:
+        return
+
+    cols, rows_per_page = 4, 3
+    MARGIN_X = 5 * mm
+    MARGIN_Y = 8 * mm
+    GAP_X    = 2 * mm
+    GAP_Y    = 3 * mm
+    tile_w   = (page_w - 2 * MARGIN_X - (cols - 1) * GAP_X) / cols
+    tile_h   = (page_h - 2 * MARGIN_Y - (rows_per_page - 1) * GAP_Y) / rows_per_page
+
+    real_legs = [l for l in legs
+                 if not l.get("is_waypoint") and not l.get("is_descent")]
+
+    # Same dest-tile logic as draw_leg_tiles_page
+    if real_legs:
+        last_leg = real_legs[-1]
+        dest     = data.destination
+        dest_lat = dest["lat"]
+        dest_lon = dest["lon"]
+        last_lat = last_leg.get("lat", dest_lat)
+        last_lon = last_leg.get("lon", dest_lon)
+        look_ahead_nm = TILE_DISPLAY_NM * (1.0 - TILE_CHKPT_Y_FRAC)
+        dist_to_dest  = gc_distance_nm(last_lat, last_lon, dest_lat, dest_lon)
+        dest_tile = {
+            "lat": dest_lat, "lon": dest_lon,
+            "segment_track_true": last_leg.get("segment_track_true", 0),
+            "landmark": dest.get("name") or dest.get("icao", ""),
+            "leg_num": last_leg.get("leg_num", 0),
+            "_cumulative_min": last_leg.get("_cumulative_min", 0),
+            "elapsed_min":     last_leg.get("elapsed_min", 0),
+            "is_dest": True,
+            "min_alt_ft": last_leg.get("min_alt_ft", 5000),
+        }
+        if dist_to_dest >= 0.05:
+            if dist_to_dest <= look_ahead_nm:
+                real_legs = real_legs[:-1] + [dest_tile]
+            else:
+                real_legs = real_legs + [dest_tile]
+
+    total_tiles  = len(real_legs)
+    pos_in_page  = 0
+    page_started = False
+
+    for tile_idx, leg in enumerate(real_legs):
+        if pos_in_page == 0:
+            if page_started:
+                c.showPage()
+            page_started = True
+            c.saveState()
+            c.setFont("Helvetica-Bold", 9)
+            route_str = (f"{data.origin.get('icao','')} → "
+                         f"{data.destination.get('icao','')}  |  "
+                         f"{data.cruise_speed_ias:.0f} kt  |  "
+                         f"{data.fuel_consumption_gph:.1f} GPH")
+            c.drawString(MARGIN_X, page_h - 5 * mm, "Vista frontal (silueta de terreno)")
+            c.drawRightString(page_w - MARGIN_X, page_h - 5 * mm, route_str)
+            c.restoreState()
+
+        col = pos_in_page % cols
+        row = pos_in_page // cols
+        tile_x = MARGIN_X + col * (tile_w + GAP_X)
+        tile_y = page_h - MARGIN_Y - 7 * mm - (row + 1) * tile_h - row * GAP_Y
+
+        leg_lat  = leg.get("lat")
+        leg_lon  = leg.get("lon")
+        bearing  = leg.get("segment_track_true", 0)
+        leg_num  = leg.get("leg_num", tile_idx + 1)
+        cum_min  = int(round(leg.get("_cumulative_min", leg.get("elapsed_min", 0))))
+        alt_ft   = leg.get("min_alt_ft", 5000)
+        is_dest  = leg.get("is_dest", False)
+
+        if leg_lat is None or leg_lon is None:
+            pos_in_page = (pos_in_page + 1) % (cols * rows_per_page)
+            continue
+
+        label = "DEST" if is_dest else f"T+{cum_min}min"
+        print(f"  [silhouette {tile_idx+1}/{total_tiles}] ({leg_lat:.3f},{leg_lon:.3f}) "
+              f"brg={bearing:.0f}° → {label}…", end="", flush=True)
+
+        sil = _build_silhouette_image(leg_lat, leg_lon, bearing, alt_ft)
+        if sil is None:
+            print(" sin imagen", flush=True)
+            c.setStrokeColor(colors.lightgrey)
+            c.rect(tile_x, tile_y, tile_w, tile_h)
+        else:
+            # Header bar drawn directly on the PIL image
+            try:
+                from PIL import ImageDraw as _ID2, ImageFont as _IF2
+                hdr_h = 22
+                hdr_img = Image.new("RGBA", sil.size, (0, 0, 0, 0))
+                sil = sil.convert("RGBA")
+                hdr_ov = Image.new("RGBA", (sil.width, hdr_h),
+                                   (0, 100, 0, 190) if is_dest else (30, 30, 30, 180))
+                sil.paste(hdr_ov, (0, 0), hdr_ov)
+                _d = _ID2.Draw(sil)
+                try:
+                    _f = _IF2.truetype("arial.ttf", 11)
+                except Exception:
+                    _f = _IF2.load_default()
+                _d.text((6, 5), label, fill=(255, 255, 255, 240), font=_f)
+                if not is_dest:
+                    _d.text((sil.width - 32, 5), f"#{leg_num}",
+                            fill=(255, 220, 0, 240), font=_f)
+                sil = sil.convert("RGB")
+            except Exception:
+                pass
+
+            bio = _io3.BytesIO()
+            sil.save(bio, format="PNG")
+            bio.seek(0)
+            c.drawImage(ImageReader(bio), tile_x, tile_y,
+                        width=tile_w, height=tile_h, preserveAspectRatio=False)
+            c.saveState()
+            c.setStrokeColor(colors.HexColor("#888888"))
+            c.setLineWidth(0.4)
+            c.rect(tile_x, tile_y, tile_w, tile_h, stroke=1, fill=0)
+            c.restoreState()
+            print(" OK", flush=True)
+
+        pos_in_page = (pos_in_page + 1) % (cols * rows_per_page)
+
+
 def draw_leg_tiles_page(c: canvas.Canvas, legs: list, data: "FlightData",
-                        page_w: float, page_h: float) -> None:
+                        page_w: float, page_h: float,
+                        page_label: str = "Fichas de tramo",
+                        bg_mode: str = "osm") -> None:
     """
     Draw A4-landscape page(s) of leg minimap tiles, 4 columns × 3 rows per page.
     Each tile is ~70mm × 67mm representing 10 NM at 1:250,000 scale, track-up.
+    bg_mode: "osm" for standard chart tiles; "satellite" for ESRI imagery.
     """
     try:
         from PIL import Image
@@ -2694,7 +3406,7 @@ def draw_leg_tiles_page(c: canvas.Canvas, legs: list, data: "FlightData",
             c.setFont("Helvetica-Bold", 7)
             c.setFillColor(colors.grey)
             route_str = (f"{data.origin['icao']} \u2192 {data.destination['icao']}  "
-                         f"– Fichas de tramo")
+                         f"\u2013 {page_label}")
             c.drawString(MARGIN_X, page_h - 5 * mm, route_str)
             page_num = page_idx + 1
             c.drawRightString(page_w - MARGIN_X, page_h - 5 * mm,
@@ -2724,9 +3436,12 @@ def draw_leg_tiles_page(c: canvas.Canvas, legs: list, data: "FlightData",
         print(f"  [tile {tile_idx+1}/{total_tiles}] ({leg_lat:.3f},{leg_lon:.3f}) "
               f"brg={bearing:.0f}° → {'DEST' if is_dest else f'T+{cum_min}min'}…",
               end="", flush=True)
+        leg_alt_ft = leg.get("min_alt_ft", 5000)
         img = _build_tile_image(leg_lat, leg_lon, bearing, lm_lat, lm_lon,
                      lm_label, leg.get("lm_type", "poi"),
-                     leg_num, cum_min, is_dest=is_dest)
+                     leg_num, cum_min, is_dest=is_dest,
+                     bg_mode=bg_mode, alt_ft=leg_alt_ft,
+                     extra_places=leg.get("lm_places", []))
         if img is None:
             print(" sin imagen", flush=True)
             c.setStrokeColor(colors.lightgrey)
@@ -2823,9 +3538,21 @@ def generate_pdf(output_path: str,
             c.restoreState()
             c.showPage()
 
-    # Leg minimap tiles page(s)
+    # Leg minimap tiles page(s) — OSM chart
     print("[+] Generando fichas de tramo (tiles OSM)…")
     draw_leg_tiles_page(c, data.legs, data, PAGE_W, PAGE_H)
+
+    # Satellite imagery page(s) — ESRI World Imagery
+    c.showPage()
+    print("[+] Generando fichas de satélite (ESRI World Imagery)…")
+    draw_leg_tiles_page(c, data.legs, data, PAGE_W, PAGE_H,
+                        page_label="Imágenes de satélite",
+                        bg_mode="satellite")
+
+    # Terrain silhouette page(s) — forward-view from each checkpoint
+    c.showPage()
+    print("[+] Generando siluetas de terreno (vista frontal)…")
+    draw_silhouette_page(c, data.legs, data, PAGE_W, PAGE_H)
 
     c.save()
     print(f"\n  PDF guardado en: {output_path}")
@@ -2866,8 +3593,16 @@ def main() -> None:
         prog="vfr_onepager",
         description="Generate a VFR trip one-pager as a duplex A4-landscape PDF.",
     )
-    parser.add_argument("origin_icao",      help="ICAO code of the departure airport")
-    parser.add_argument("destination_icao", help="ICAO code of the destination airport")
+    parser.add_argument("origin_icao",      nargs='?', help="ICAO code of the departure airport")
+    parser.add_argument("destination_icao", nargs='?', help="ICAO code of the destination airport")
+    parser.add_argument(
+        "--pairs", action="append", default=None,
+        help=(
+            "Comma-separated list (or repeat) of ORIG:DEST pairs to process in batch,\n"
+            "e.g. --pairs LEPP:LERJ,LEPP:LESO or --pairs LEPP:LERJ --pairs LEBL:LEMG.\n"
+            "When provided the script will generate one PDF per pair and exit."
+        ),
+    )
     parser.add_argument("cruise_speed_ias", type=float,
                         help="Cruise speed in knots IAS")
     parser.add_argument("fuel_consumption_gph", type=float,
@@ -2917,6 +3652,81 @@ def main() -> None:
               "table (runway heading, until 1000 ft AGL) before turning to cruise track."),
     )
     args = parser.parse_args()
+
+    # If --pairs supplied, spawn a separate run for each ORIG:DEST pair using the
+    # same CLI options (except --pairs). This avoids refactoring the whole main
+    # flow while adding batch capability.
+    if args.pairs:
+        import subprocess, sys, os
+
+        def _build_base_cmd(pair_orig: str, pair_dest: str) -> list:
+            cmd = [sys.executable, os.path.abspath(__file__), pair_orig, pair_dest,
+                   str(args.cruise_speed_ias), str(args.fuel_consumption_gph)]
+            if args.output:
+                # avoid clobbering one output for multiple pairs; let user specify
+                # per-pair output by omitting --output or by providing template
+                cmd += ["-o", args.output]
+            if args.via:
+                for v in args.via:
+                    cmd += ["--via", v]
+            if args.one_face:
+                cmd.append("--one-face")
+            if args.wind:
+                cmd += ["--wind", args.wind]
+            if args.leg_minutes is not None:
+                cmd += ["--leg-minutes", str(args.leg_minutes)]
+            if args.terrain_buffer is not None:
+                cmd += ["--terrain-buffer", str(args.terrain_buffer)]
+            if args.climb_rate is not None:
+                cmd += ["--climb-rate", str(args.climb_rate)]
+            if args.departure_runway is not None:
+                cmd += ["--departure-runway", str(args.departure_runway)]
+            return cmd
+
+        # Expand any comma-separated entries and validate ORIG:DEST format
+        pairs_expanded: list[tuple[str, str]] = []
+        for chunk in args.pairs:
+            for item in chunk.split(','):
+                item = item.strip()
+                if not item:
+                    continue
+                if ':' not in item:
+                    parser.error(f"Invalid pair '{item}'; expected ORIG:DEST")
+                o, d = item.split(':', 1)
+                pairs_expanded.append((o.upper().strip(), d.upper().strip()))
+
+        # Launch a subprocess per pair (forward) and its automatic return (reverse).
+        for orig, dest in pairs_expanded:
+            print(f"[batch] Generating for {orig}→{dest} …")
+            cmd_fwd = _build_base_cmd(orig, dest)
+            res = subprocess.run(cmd_fwd)
+            if res.returncode != 0:
+                print(f"[batch] {orig}→{dest} failed (exit {res.returncode})", file=sys.stderr)
+            else:
+                print(f"[batch] {orig}→{dest} done")
+
+            # Now generate the return route dest->orig. If the user supplied a
+            # specific --output filename, synthesize a separate filename for the
+            # return by appending "_return" before the extension. Otherwise let
+            # the child process choose its default name.
+            print(f"[batch] Generating return for {dest}→{orig} …")
+            if args.output:
+                base, ext = os.path.splitext(args.output)
+                ret_out = f"{base}_return{ext}"
+                cmd_rev = _build_base_cmd(dest, orig)
+                cmd_rev += ["-o", ret_out]
+            else:
+                cmd_rev = _build_base_cmd(dest, orig)
+
+            res2 = subprocess.run(cmd_rev)
+            if res2.returncode != 0:
+                print(f"[batch] {dest}→{orig} failed (exit {res2.returncode})", file=sys.stderr)
+            else:
+                print(f"[batch] {dest}→{orig} done")
+        return
+
+    if not args.origin_icao or not args.destination_icao:
+        parser.error("origin and destination ICAO required when --pairs is not used")
 
     origin_icao  = args.origin_icao.upper().strip()
     dest_icao    = args.destination_icao.upper().strip()

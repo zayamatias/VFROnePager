@@ -63,6 +63,34 @@ python3 vfr_onepager.py LEPP LEZG 110 6 \
 	-o trip_via.pdf
 ```
 
+Batch processing
+----------------
+You can generate PDFs for multiple origin→destination pairs in one command using the
+`--pairs` option. Provide a comma-separated list or repeat the flag. The script will
+generate one PDF per pair and also automatically produce the return route PDF
+(DEST→ORIG) for each pair.
+
+Examples:
+
+```bash
+# Comma-separated pairs
+python3 vfr_onepager.py --pairs LEPP:LERJ,LEPP:LESO 100 10 --one-face
+
+# Repeat the flag for multiple pairs
+python3 vfr_onepager.py --pairs LEPP:LERJ --pairs LEBL:LEMG 100 10
+
+# If you pass -o output.pdf, the return file will be written as output_return.pdf
+python3 vfr_onepager.py --pairs LEPP:LERJ 100 10 -o LEPP_LERJ_vfr.pdf
+``` 
+
+Notes:
+- Each pair is processed in a separate subprocess; outputs are written using the
+	same naming logic as single runs (default: `<ORIG>_<DEST>_vfr.pdf`).
+- When `-o/--output` is provided the forward run uses that filename and the return
+	run appends `_return` before the extension (e.g. `LEPP_LERJ_vfr_return.pdf`).
+- The `--pairs` option preserves all other CLI options (`--via`, `--one-face`,
+	`--leg-minutes`, etc.) and forwards them to each generated run.
+
 Multiple waypoints (VIA)
 ------------------------
 You can include intermediate waypoints using the `--via` option. Repeat `--via` for multiple points in the order you want them flown (origin → WP1 → WP2 → … → destination).
