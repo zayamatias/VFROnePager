@@ -3671,6 +3671,11 @@ def main() -> None:
               "When given, adds a 2-minute straight-out climb row at the top of the trip "
               "table (runway heading, until 1000 ft AGL) before turning to cruise track."),
     )
+    parser.add_argument(
+        "--warm-cache", action="store_true", default=False,
+        help=("Pre-fetch OSM and satellite tiles for all route legs and populate the "
+              "local cache before generating the PDF. Useful on flaky connections."),
+    )
     args = parser.parse_args()
 
     # If --pairs supplied, spawn a separate run for each ORIG:DEST pair using the
@@ -4122,6 +4127,36 @@ def main() -> None:
         cruise_speed_ias=cruise_kts,
         fuel_consumption_gph=fuel_gph,
     )
+    # Optional: pre-warm tile cache for all legs prior to PDF generation
+    if getattr(args, "warm_cache", False):
+        try:
+            print("[+] Pre-warming tile cache for route (OSM + satellite)...", flush=True)
+            def _prewarm(data: "FlightData") -> None:
+                # Use the same canvas size as tile generator so identical tiles are fetched
+                CANVAS_HALF_NM = TILE_DISPLAY_NM * 1.5
+                # Prefer cruise altitude for satellite zoom selection
+                cruise_alt = data.cruise_alt_ft or 3000
+                for i, leg in enumerate(data.legs, start=1):
+                    if leg.get("is_waypoint"):
+                        continue
+                    lat = leg.get("lat")
+                    lon = leg.get("lon")
+                    if lat is None or lon is None:
+                        continue
+                    print(f"  [warm] leg {i}: prefetch tiles @ ({lat:.4f},{lon:.4f})", end="\r")
+                    try:
+                        _get_stitched_map(lat, lon, CANVAS_HALF_NM)
+                    except Exception:
+                        pass
+                    try:
+                        z = _zoom_from_altitude(cruise_alt, lat)
+                        _get_stitched_satellite(lat, lon, CANVAS_HALF_NM, zoom=z)
+                    except Exception:
+                        pass
+                print()
+            _prewarm(flight_data)
+        except Exception:
+            print("  [warn] cache pre-warm failed; continuing without pre-warm", file=sys.stderr)
     generate_pdf(output_path, flight_data, one_face=args.one_face)
 
     print(f"\nListo. Abrir '{output_path}' e imprimir duplex (voltear por borde largo).\n")
