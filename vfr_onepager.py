@@ -2238,7 +2238,11 @@ def _fetch_osm_tile(z: int, x: int, y: int, labels: bool = False):
         try:
             return Image.open(cache_path).convert("RGBA")
         except Exception:
-            pass
+            # corrupted cache — remove so next run will refetch
+            try:
+                _os.remove(cache_path)
+            except Exception:
+                pass
     url_tmpl = OSM_TILE_URL_LABELS if labels else OSM_TILE_URL
     url      = url_tmpl.format(z=z, x=x, y=y)
     try:
@@ -2431,24 +2435,40 @@ def _fetch_esri_sat_tile(z: int, x: int, y: int):
         try:
             return Image.open(cache_path).convert("RGBA")
         except Exception:
-            pass
+            try:
+                _os.remove(cache_path)
+            except Exception:
+                pass
     url = ESRI_SAT_URL.format(z=z, y=y, x=x)
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "VFROnePager/1.0 (educational)"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+    # Try a few times to avoid transient network/errors or remote rate-limits
+    last_exc = None
+    for attempt in range(3):
         try:
-            img.save(cache_path, "JPEG", quality=85)
-        except Exception:
-            pass
-        return img
-    except Exception as exc:
-        print(f"    [warn] ESRI sat tile {z}/{y}/{x}: {exc}", file=sys.stderr)
-        return Image.new("RGBA", (256, 256), (100, 100, 100, 255))
+            resp = requests.get(
+                url,
+                headers={"User-Agent": "VFROnePager/1.0 (educational)"},
+                timeout=12,
+            )
+            resp.raise_for_status()
+            # Quick sanity: ensure response is an image-like payload
+            ctype = resp.headers.get("Content-Type", "")
+            if not ctype.startswith("image/") and len(resp.content) < 500:
+                raise ValueError(f"unexpected content type: {ctype}")
+            img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+            try:
+                img.save(cache_path, "JPEG", quality=85)
+            except Exception:
+                pass
+            return img
+        except Exception as exc:
+            last_exc = exc
+            # brief backoff
+            time.sleep(0.8 + attempt * 0.5)
+            continue
+
+    # All attempts failed — log and return a neutral-grey fallback tile
+    print(f"    [warn] ESRI sat tile {z}/{y}/{x} failed after retries: {last_exc}", file=sys.stderr)
+    return Image.new("RGBA", (256, 256), (100, 100, 100, 255))
 
 
 def _get_stitched_satellite(center_lat: float, center_lon: float,
