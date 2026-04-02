@@ -798,13 +798,17 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
             found = []
         if found:
             candidates_all.extend(found)
-        # If we already have any left-side candidate among accumulated, stop expanding
+        # Stop expanding only when we have an AHEAD-LEFT (270°–360°) candidate.
+        # Behind-left candidates are never used — pilot only sees what's ahead-left.
         if track_deg is not None and ac_lat is not None and ac_lon is not None and candidates_all:
             try:
-                any_left = any(180 <= ((bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"]) - track_deg + 360) % 360) < 360 for c in candidates_all)
+                any_ahead_left = any(
+                    270 <= ((bearing_to_destination(ac_lat, ac_lon, c["lat"], c["lon"]) - track_deg + 360) % 360) < 360
+                    for c in candidates_all
+                )
             except Exception:
-                any_left = False
-            if any_left:
+                any_ahead_left = False
+            if any_ahead_left:
                 break
     candidates = candidates_all
     if not candidates:
@@ -845,35 +849,31 @@ def find_best_landmark(lat: float, lon: float, zoom: int = 12, radius_nm: float 
                 base = 42
             else:
                 base = 10
-        # Position bonus when track is known: prefer ahead-left over behind-left
+        # Within the 270°–360° sector, give a small bonus to candidates
+        # closer to dead-ahead-left (315°) — most likely to be in the pilot's
+        # forward field of view.
         if track_deg is not None and ac_lat is not None and ac_lon is not None:
             try:
                 rb = _rel_bearing(c)
-                if 270 <= rb < 360:      # ahead-left quadrant
-                    base += 20
-                elif 180 <= rb < 270:    # behind-left quadrant
-                    base += 5
-                # right-side candidates get no bonus (will be filtered out below)
+                if 270 <= rb < 360:
+                    base += max(0, 20 - int(abs(rb - 315) / 5))
             except Exception:
                 pass
         return base
 
-    # If track info is available, prefer candidates on the LEFT of track.
-    # Strategy: prefer AHEAD-LEFT (270..360) first, then BEHIND-LEFT (180..270).
-    # Only fall back to the full candidate set when there is literally no POI
-    # on the left side at all.
+    # ONLY use ahead-left candidates (270°–360° relative to track).
+    # Never fall back to behind-left: a reference the pilot already passed
+    # is useless for navigation.  If nothing is in the ahead-left sector,
+    # return a Nominatim reverse-geocode instead.
     if track_deg is not None and ac_lat is not None and ac_lon is not None:
         try:
             ahead_left = [c for c in candidates if 270 <= _rel_bearing(c) < 360]
-            behind_left = [c for c in candidates if 180 <= _rel_bearing(c) < 270]
         except Exception:
             ahead_left = []
-            behind_left = []
         if ahead_left:
             candidates = ahead_left
-        elif behind_left:
-            candidates = behind_left
-        # else: keep full list as a last resort (no POIs on the left at all)
+        else:
+            return get_landmark(lat, lon, zoom=zoom), lat, lon, "poi"
 
     # Evaluate visibility: prefer candidates that are not clearly occluded by terrain
     visible = []
@@ -2276,6 +2276,72 @@ def _latlon_to_px(lat: float, lon: float, geo: dict) -> tuple:
     return int(round(px)), int(round(py))
 
 
+def _draw_poi_icon(draw, cx: int, cy: int, r: int, lm_type: str) -> None:
+    """
+    Draw a small cartographic symbol for the given landmark type.
+    Uses PIL polygon/ellipse primitives — no letter shortcuts.
+    """
+    WHITE  = (255, 255, 255, 255)
+    if lm_type == "peak":
+        # Brown/orange mountain triangle with white snow cap
+        pts = [(cx, cy - r), (cx - r, cy + r), (cx + r, cy + r)]
+        draw.polygon(pts, fill=(160, 100, 35, 235), outline=WHITE)
+        cap = [(cx, cy - r), (cx - r // 2, cy - r + r // 2),
+               (cx + r // 2, cy - r + r // 2)]
+        draw.polygon(cap, fill=(240, 240, 240, 220))
+    elif lm_type in ("lake", "water"):
+        # Solid blue oval
+        draw.ellipse([cx - r, cy - int(r * 0.7), cx + r, cy + int(r * 0.7)],
+                     fill=(0, 110, 210, 230), outline=WHITE, width=2)
+        # Highlight stripe
+        draw.arc([cx - r + 4, cy - int(r * 0.5), cx + r - 4, cy],
+                 start=200, end=340, fill=(180, 220, 255, 200), width=2)
+    elif lm_type == "river":
+        # Blue wavy line — draw as a thicker sinusoidal stroke
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                     fill=(0, 130, 200, 210), outline=WHITE, width=2)
+        step = max(1, r // 4)
+        for xi in range(-r + 3, r - 2):
+            yi = int((r * 0.35) * math.sin(xi * math.pi / (r * 0.6)))
+            draw.point((cx + xi, cy + yi), fill=WHITE)
+            draw.point((cx + xi, cy + yi + 1), fill=WHITE)
+    elif lm_type == "viewpoint":
+        # Yellow diamond
+        pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
+        draw.polygon(pts, fill=(220, 170, 0, 235), outline=WHITE)
+        draw.ellipse([cx - r // 3, cy - r // 3, cx + r // 3, cy + r // 3],
+                     fill=(80, 40, 0, 240))
+    elif lm_type == "historic":
+        # Dark-red castle tower with battlements
+        tw = max(4, r // 2)
+        draw.rectangle([cx - tw, cy - r + r // 3, cx + tw, cy + r],
+                       fill=(140, 50, 30, 230), outline=WHITE, width=1)
+        for mx in [cx - tw, cx - tw // 2, cx + 1]:
+            draw.rectangle([mx, cy - r, mx + tw - 2, cy - r + r // 3],
+                            fill=(140, 50, 30, 230), outline=WHITE, width=1)
+    elif lm_type == "town":
+        # Simple house: rectangle body + triangular roof
+        hw = max(3, int(r * 0.6))
+        hh = max(3, int(r * 0.6))
+        draw.rectangle([cx - hw, cy, cx + hw, cy + hh],
+                       fill=(100, 100, 110, 220), outline=WHITE, width=1)
+        roof = [(cx - r, cy), (cx, cy - r), (cx + r, cy)]
+        draw.polygon(roof, fill=(180, 60, 50, 220), outline=WHITE)
+    elif lm_type == "place_of_worship":
+        # Cross on a base
+        tw = max(2, r // 3)
+        draw.rectangle([cx - tw, cy - r, cx + tw, cy + r],
+                       fill=(140, 0, 100, 230), outline=WHITE, width=1)
+        draw.rectangle([cx - r, cy - r + r // 3, cx + r, cy - r + r // 3 + tw * 2],
+                       fill=(140, 0, 100, 230), outline=WHITE, width=1)
+    else:
+        # Map pin: filled circle + small downward pointer
+        draw.ellipse([cx - r, cy - r, cx + r, cy],
+                     fill=(50, 160, 50, 225), outline=WHITE, width=2)
+        draw.polygon([(cx - r // 2, cy), (cx + r // 2, cy), (cx, cy + r)],
+                     fill=(50, 160, 50, 225))
+
+
 def _rotate_point_cw(px: float, py: float, cx: float, cy: float,
                      bearing_deg: float) -> tuple:
     """
@@ -2473,34 +2539,14 @@ def _build_tile_image(leg_lat: float, leg_lon: float,
             except Exception:
                 _font = ImageFont.load_default()
 
-        # Small pictogram/icon near the landmark dot based on `lm_type`.
+        # Cartographic icon next to the landmark dot based on `lm_type`.
         try:
-            icon_map = {
-                "peak":       ("P", (180, 80, 0)),
-                "lake":       ("L", (0, 120, 200)),
-                "river":      ("R", (0, 120, 200)),
-                "viewpoint":  ("V", (255, 200, 0)),
-                "airport":    ("A", (60, 60, 60)),
-                "historic":   ("H", (150, 75, 0)),
-                "water_tower":("T", (120, 120, 120)),
-                "place_of_worship": ("+", (120, 0, 80)),
-                "town":       ("t", (80, 80, 80)),
-                "poi":        ("•", (80, 80, 80)),
-            }
-            ch, col = icon_map.get(lm_type, icon_map["poi"])
-            icon_r = 10
+            icon_r = 11
             ix = lx_i + R2 + icon_r + 4
             iy = ly_i - icon_r
             if ix + icon_r > TILE_DISPLAY_PX - 6:
                 ix = lx_i - R2 - icon_r - 4
-            draw.ellipse([ix - icon_r, iy - icon_r, ix + icon_r, iy + icon_r],
-                         fill=(col[0], col[1], col[2], 230), outline=(255, 255, 255, 255), width=2)
-            try:
-                _ifont = _font if _font is not None else ImageFont.load_default()
-                w_ch, h_ch = _ifont.getsize(ch)
-                draw.text((ix - w_ch / 2, iy - h_ch / 2), ch, font=_ifont, fill=(255, 255, 255, 255))
-            except Exception:
-                pass
+            _draw_poi_icon(draw, ix, iy, icon_r, lm_type)
         except Exception:
             pass
 
